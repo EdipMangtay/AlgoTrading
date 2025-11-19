@@ -1,0 +1,5 @@
+ccxt==4.2.80
+pandas
+numpy
+python-dotenv
+requests
