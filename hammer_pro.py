@@ -44,27 +44,27 @@ VWAP_WINDOW        = 120   # 2 dk
 SIGMA_WINDOW       = 60    # 1 dk
 POLY_WINDOW        = 30    # son 30 sn
 
-# 🔧 OPTUNA SONUÇLARI GÖMÜLDÜ
-BASE_Z_SCORE_THRESHOLD   = 2.506125147502857
-VWAP_STRETCH_THRESHOLD   = 1.9855807644923995
+# 🔧 OPTUNA SONUÇLARI (Entegre Edilmiş)
+BASE_Z_SCORE_THRESHOLD   = 2.3362534910756816   # BASE_Z
+VWAP_STRETCH_THRESHOLD   = 0.9429763498747289   # VWAP_STR
 
-SIGMA_MOVE_STRICT        = 1.9940935349673694
-ENTRY_STRICTNESS         = 1.5640220883287945
+SIGMA_MOVE_STRICT        = 2.99991624948854     # SIGMA_STR
+ENTRY_STRICTNESS         = 2.136320461750079    # ENTRY_STR
 
-Z_EXIT_BAND              = 0.39694508157160496
-CURVE_ACCELERATOR        = 0.4785662272373655
+Z_EXIT_BAND              = 0.16127896580962736  # Z_EXIT
+CURVE_ACCELERATOR        = 1.1923108093966073   # CURV_ACC
 
-MIN_CURVATURE            = 4.9376511621030375e-05
-EMA_ALPHA                = 0.12065578244594607
-MIN_RANGE_PCT            = 0.3574704654934885
+MIN_CURVATURE            = 0.00065169819311521  # MIN_CURV
+EMA_ALPHA                = 0.10797947074829366  # EMA_AL
+MIN_RANGE_PCT            = 1.496586562947317    # MIN_RNG
 
 # Hareket büyüklüğüne göre adaptif reversal yüzdeleri
-REVERSAL_CONFIRM_PCT_MIN = 0.3
+REVERSAL_CONFIRM_PCT_MIN = 0.4798697796795814   # REV_MIN
 DYNAMIC_THRESHOLDS = [
-    (15.0, 0.5),
-    (7.0,  0.8),
-    (3.0,  1.2),
-    (1.5,  1.8),
+    (15.0, 0.3293555103144567),   # DT1
+    (7.0,  0.6181660068407256),   # DT2
+    (3.0,  1.942805602324997),    # DT3
+    (1.5,  1.8310177801507008),   # DT4
 ]
 
 COOLDOWN_SEC       = 90      # sinyal sonrası aynı sembolde bekleme
@@ -413,8 +413,6 @@ class UltimateReversalWS:
 
             bounce_pct   = (current_price - st["nadir"]) / st["nadir"] * 100
             bounce_sigma = (current_price - st["nadir"]) / max(st["locked_sigma"], 1e-6)
-
-            # Ek şart: Z-score artık aşırı negatif değil, toparlamış olmalı
             z_back_to_mean = z >= -dyn_z_th * Z_EXIT_BAND
 
             if (
@@ -460,7 +458,7 @@ class UltimateReversalWS:
     ):
         emoji_side = "🔴 SHORT" if side == "SHORT" else "🟢 LONG"
         title = "PUMP REVERSAL" if side == "SHORT" else "DUMP BOUNCE"
-        accel_text = "EVET 🏎️" if curve_broken else "HAYIR"
+        accel_text = "EVET 🏎" if curve_broken else "HAYIR"
 
         # Kalite metriği (sigma'ya göre)
         if reversal_sigma >= 3:
@@ -470,7 +468,7 @@ class UltimateReversalWS:
         elif reversal_sigma >= 1.5:
             quality = "✅ ORTA"
         else:
-            quality = "⚠️ ZAYIF (dikkat)"
+            quality = "⚠ ZAYIF (dikkat)"
 
         binance_url = f"https://www.binance.com/en/futures/{symbol_id}"
         tv_url      = f"https://www.tradingview.com/chart/?symbol=BINANCE%3A{symbol_id}"
@@ -523,6 +521,6 @@ if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(engine.run())   
+        loop.run_until_complete(engine.run())
     except KeyboardInterrupt:
-        log("Durduruldu.") 
+        log("Durduruldu.")

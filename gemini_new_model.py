@@ -1,291 +1,599 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
+"""
+ULTIMATE REVERSAL ENGINE (WebSocket Edition, Meta-Label + Regime Detection)
+"""
 
-import time
 import asyncio
-import traceback
-from dataclasses import dataclass
-from typing import Optional, Dict, Tuple
+import json
+import time
+from collections import defaultdict, deque
 
 import numpy as np
 import ccxt.async_support as ccxt_async
 from telegram import Bot
+import websockets
 
 # ==============================
-# 1) AYARLAR (HASSAS QUANT AYARLARI)
+# 1) AYARLAR
 # ==============================
 
+# 🔐 TELEGRAM
 TG_BOT_TOKEN = "7959911378:AAEl6WlhbJ243tK-WdnTlsoP_scf0RjBpVQ"
 TG_CHAT_ID   = 1222350744
 
+# 🔐 BINANCE
 BINANCE_API_KEY    = "NQAXu0lgpVinMKr5pAiANMFqLunbiZ5eYMZbm6Zbinr83cEfgextjsalzS87YATQ"
 BINANCE_API_SECRET = "DHdJl7vTnitQvO8GznnXIa66eqho4FOI58gXZN9kJpuWFiyvsVynmGaWOr5oioNe"
 
-SCAN_INTERVAL_SEC      = 3         # Çok hızlı tarama
-QUOTE                  = "USDT"
-MAX_CONCURRENT_SYMBOLS = 10        # Order Book çektiğimiz için sayıyı düşürdük
+# 1 saniyelik internal bar ayarları
+CONTEXT_WINDOW     = 300   # 5 dk
+VWAP_WINDOW        = 120   # 2 dk
+SIGMA_WINDOW       = 60    # 1 dk
+POLY_WINDOW        = 30    # son 30 sn
 
-# EŞİKLER
-MIN_OBI_SCORE          = -0.3      # Satış baskısı > %30 (Short için)
-MAX_HURST              = 0.45      # 0.5 altı "Mean Reverting" (Dönüşe meyilli) demektir.
-MIN_QUANT_SCORE        = 80.0      # Nihai Skor Eşiği
+# 🔧 OPTUNA SONUÇLARI GÖMÜLDÜ
+BASE_Z_SCORE_THRESHOLD   = 2.50
+VWAP_STRETCH_THRESHOLD   = 1.98
 
-# ==============================
-# 2) İLERİ MATEMATİK MOTORU
-# ==============================
+SIGMA_MOVE_STRICT        = 1.99
+ENTRY_STRICTNESS         = 1.56
+
+Z_EXIT_BAND              = 0.39
+CURVE_ACCELERATOR        = 0.47
+
+MIN_CURVATURE            = 4.9e-05
+EMA_ALPHA                = 0.12
+MIN_RANGE_PCT            = 0.35
+
+# Hareket büyüklüğüne göre adaptif reversal yüzdeleri
+REVERSAL_CONFIRM_PCT_MIN = 0.3
+DYNAMIC_THRESHOLDS = [
+    (15.0, 0.5),
+    (7.0,  0.8),
+    (3.0,  1.2),
+    (1.5,  1.8),
+]
+
+COOLDOWN_SEC = 90
+WS_URL = "wss://fstream.binance.com/stream?streams=!miniTicker@arr"
+
 
 def log(*args):
     print(*args, flush=True)
 
-@dataclass
-class QuantData:
-    real_price: float
-    kalman_diff: float
-    hurst: float
-    obi: float
-    velocity: float
-    acceleration: float
-    total_score: float
-    signal: str
 
-class AdvancedQuantMath:
-    
+# ==============================
+# 2) MATEMATİK MOTORU
+# ==============================
+
+class UltimateMath:
     @staticmethod
-    def kalman_filter(data: np.ndarray, n_iter: int = 5) -> np.ndarray:
-        """
-        Basitleştirilmiş 1D Kalman Filtresi.
-        Fiyat serisindeki gürültüyü (noise) temizler, gerçek trendi (state) bulur.
-        """
-        sz = (len(data),)
-        # Başlangıç tahminleri
-        xhat = np.zeros(sz)      # Tahmin (Posterior)
-        P = np.zeros(sz)         # Hata kovaryansı
-        xhatminus = np.zeros(sz) # Önsel tahmin (Prior)
-        Pminus = np.zeros(sz)    # Önsel hata kovaryansı
-        K = np.zeros(sz)         # Kalman Kazancı
-
-        Q = 1e-5 # Süreç gürültü varyansı
-        R = 0.01 # Ölçüm gürültü varyansı
-
-        xhat[0] = data[0]
-        P[0] = 1.0
-
-        for k in range(1, len(data)):
-            # Zaman güncellemesi
-            xhatminus[k] = xhat[k-1]
-            Pminus[k] = P[k-1] + Q
-
-            # Ölçüm güncellemesi
-            K[k] = Pminus[k] / (Pminus[k] + R)
-            xhat[k] = xhatminus[k] + K[k] * (data[k] - xhatminus[k])
-            P[k] = (1 - K[k]) * Pminus[k]
-
-        return xhat
+    def ema(prices, alpha=EMA_ALPHA):
+        prices = np.array(prices, dtype=float)
+        ema = np.zeros_like(prices)
+        ema[0] = prices[0]
+        for i in range(1, len(prices)):
+            ema[i] = alpha * prices[i] + (1 - alpha) * ema[i-1]
+        return ema
 
     @staticmethod
-    def calculate_hurst(series: np.ndarray) -> float:
-        """
-        Hurst Üssü (Hurst Exponent) Hesabı.
-        H < 0.5: Mean Reverting (Fiyat ortalamaya dönecek -> SHORT/LONG fırsatı)
-        H > 0.5: Trending (Fiyat gitmeye devam edecek -> DOKUNMA)
-        H = 0.5: Random Walk (Rastgele)
-        """
-        lags = range(2, 10)
-        tau = [np.sqrt(np.std(np.subtract(series[lag:], series[:-lag]))) for lag in lags]
-        
-        # Hata önleme
-        if len(tau) < 2 or np.any(np.isnan(tau)) or np.any(np.array(tau) == 0):
-            return 0.5
-            
-        # Log-Log düzleminde eğim hesabı
+    def get_kinematics(prices):
+        prices = np.array(prices, dtype=float)
+        v = np.diff(prices)
+        a = np.diff(v)
+        v_curr = float(v[-1]) if len(v) > 0 else 0.0
+        a_curr = float(a[-1]) if len(a) > 0 else 0.0
+        return v_curr, a_curr
+
+    @staticmethod
+    def rolling_vwap(prices, volumes):
+        p = np.array(prices, dtype=float)
+        v = np.array(volumes, dtype=float)
+        pv = np.sum(p * v)
+        vv = np.sum(v)
+        if vv == 0:
+            return float(p[-1])
+        return float(pv / vv)
+
+    @staticmethod
+    def z_score(window_prices, current_price):
+        arr = np.array(window_prices, dtype=float)
+        mean = float(arr.mean())
+        std  = float(arr.std())
+        if std == 0:
+            std = max(abs(mean) * 1e-4, 1e-6)
+        z = (current_price - mean) / std
+        return z, mean, std
+
+    @staticmethod
+    def get_sigma(window_prices):
+        arr = np.array(window_prices, dtype=float)
+        mean = float(arr.mean())
+        std  = float(arr.std())
+        if std == 0:
+            std = max(abs(mean) * 1e-4, 1e-6)
+        return mean, std
+
+    @staticmethod
+    def get_dynamic_reversal_threshold(move_pct):
+        abs_move = abs(move_pct)
+        for limit, thr in DYNAMIC_THRESHOLDS:
+            if abs_move >= limit:
+                return max(thr, REVERSAL_CONFIRM_PCT_MIN)
+        return 999.0
+
+    @staticmethod
+    def poly_curve_signal(prices_tail, side):
+        if len(prices_tail) < POLY_WINDOW:
+            return False, 0.0, 0.0, 0.0
+
+        y = np.array(prices_tail[-POLY_WINDOW:], dtype=float)
+        x = np.arange(len(y))
         try:
-            m = np.polyfit(np.log(lags), np.log(tau), 1)
-            hurst = m[0] * 2.0
-            return float(hurst)
-        except:
-            return 0.5
+            coeffs = np.polyfit(x, y, 2)
+        except Exception:
+            return False, 0.0, 0.0, 0.0
 
-    @staticmethod
-    def calculate_obi(bids, asks, depth=10) -> float:
-        """
-        Order Book Imbalance (OBI).
-        Tahtanın ilk 'depth' seviyesindeki hacim dengesi.
-        Pozitif: Alıcı baskın.
-        Negatif: Satıcı baskın.
-        """
-        bid_vol = sum([b[1] for b in bids[:depth]])
-        ask_vol = sum([a[1] for a in asks[:depth]])
-        
-        if (bid_vol + ask_vol) == 0: return 0.0
-        
-        imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)
-        return imbalance
+        a, b, c = coeffs
+        curvature = a
+        slope = b
+        current_slope = 2 * a * (len(x) - 1) + b
 
-    @staticmethod
-    def analyze_quantum(prices: np.ndarray, bids: list, asks: list) -> Optional[QuantData]:
-        """
-        Tüm ileri matematiği birleştirir.
-        """
-        if len(prices) < 30: return None
+        if side == "SHORT":
+            broken = (curvature < -MIN_CURVATURE) and (current_slope < 0)
+        else:
+            broken = (curvature > MIN_CURVATURE) and (current_slope > 0)
 
-        # 1. KALMAN FİLTRESİ
-        kalman_series = AdvancedQuantMath.kalman_filter(prices)
-        kalman_price = kalman_series[-1]
-        current_price = prices[-1]
-        
-        # Kalman Farkı: Fiyat, filtrelenmiş "gerçek" değerden ne kadar saptı?
-        # Eğer fiyat Kalman'ın çok üstündeyse, "köpük"tür.
-        kalman_diff_pct = (current_price - kalman_price) / kalman_price * 100
+        return broken, curvature, slope, current_slope
 
-        # 2. KİNEMATİK (Hız ve İvme - Kalman verisi üzerinden)
-        velocity = kalman_series[-1] - kalman_series[-2]
-        acceleration = velocity - (kalman_series[-2] - kalman_series[-3])
-
-        # 3. HURST EXPONENT (Kaos Analizi)
-        # Son 50 mumluk fractal yapı
-        hurst = AdvancedQuantMath.calculate_hurst(prices)
-
-        # 4. ORDER BOOK IMBALANCE
-        obi = AdvancedQuantMath.calculate_obi(bids, asks)
-
-        # --- PUANLAMA MOTORU ---
-        score = 0.0
-        signal = None
-
-        # Short Sinyali Mantığı (Pump Sonrası Dönüş)
-        # 1. Fiyat Kalman'ın üzerinde (Köpük var)
-        # 2. İvme negatif (Gaz kesildi)
-        # 3. Hurst < 0.5 (Piyasa ortalamaya dönmek istiyor, trend değil)
-        # 4. OBI Negatif (Satıcılar tahtaya yığıldı)
-        
-        if kalman_diff_pct > 0.3: # %0.3 köpük (1dk için yüksektir)
-            base = 40
-            
-            if acceleration < 0: base += 15
-            if velocity < 0: base += 10
-            
-            # Hurst Kritik Filtre: Trend varsa girme!
-            if hurst < 0.45: 
-                base += 20
-            elif hurst > 0.60:
-                base -= 50 # Ceza puanı (Güçlü trend, short açma!)
-            
-            # Tahta Analizi
-            if obi < MIN_OBI_SCORE: base += 15 # Güçlü satıcı baskısı
-            
-            if base >= MIN_QUANT_SCORE:
-                score = base
-                signal = "SHORT"
-
-        # Long mantığı simetrik olarak kurulabilir, şimdilik Short odaklı (Pump avcısı)
-        elif kalman_diff_pct < -0.3:
-            base = 40
-            if acceleration > 0: base += 15
-            if hurst < 0.45: base += 20
-            if obi > abs(MIN_OBI_SCORE): base += 15
-            
-            if base >= MIN_QUANT_SCORE:
-                score = base
-                signal = "LONG"
-
-        if signal:
-            return QuantData(kalman_price, kalman_diff_pct, hurst, obi, velocity, acceleration, score, signal)
-        
-        return None
 
 # ==============================
-# 3) UYGULAMA
+# 3) REJİM TESPİTİ (TREND + VOLATILITE)
 # ==============================
 
-class QuantumScanner:
+def detect_regime(sigma_short, sigma_avg, v, a):
+    """
+    3 rejim:
+    - HIGH VOL CHOP
+    - TREND (UP/DOWN)
+    - NORMAL
+    """
+    if sigma_avg <= 0:
+        return "NORMAL"
+
+    vol_ratio = sigma_short / sigma_avg
+
+    if vol_ratio > 1.8:
+        return "HIGH_CHOP"
+
+    if a > 0 and v > 0:
+        return "UP_TREND"
+
+    if a < 0 and v < 0:
+        return "DOWN_TREND"
+
+    return "NORMAL"
+
+
+# ==============================
+# 4) META-LABEL FİLTRESİ (HL / LH TESTİ)
+# ==============================
+
+async def metalabel_confirmation(engine, sym, side, window=6):
+    """
+    Sinyal sonrası 6 saniyelik mikro test:
+    - SHORT için: fiyat en az birkaç tik aşağı (LH) yapmalı
+    - LONG için: fiyat en az birkaç tik yukarı (HL) yapmalı
+    engine.price_buffers[sym] canlı olarak güncelleniyor.
+    """
+    if sym not in engine.price_buffers or len(engine.price_buffers[sym]) == 0:
+        return False
+
+    base = float(engine.price_buffers[sym][-1])
+
+    for _ in range(window):
+        await asyncio.sleep(1.0)
+
+        if sym not in engine.price_buffers or len(engine.price_buffers[sym]) == 0:
+            continue
+
+        cur = float(engine.price_buffers[sym][-1])
+
+        if side == "SHORT":
+            # aşağı yönlü mikro teyit
+            if cur < base:
+                return True
+
+        elif side == "LONG":
+            # yukarı yönlü mikro teyit
+            if cur > base:
+                return True
+
+    return False
+
+
+# ==============================
+# 5) WEBSOCKET + ENGINE
+# ==============================
+
+class UltimateReversalWS:
     def __init__(self):
-        log("[INIT] Quantum Sniper (Kalman/Hurst/OBI) Başlatılıyor...")
+        log("[INIT] Ultimate Reversal Engine (Meta-Label + Regime) başlatılıyor...")
         self.ex = ccxt_async.binanceusdm({
             "apiKey": BINANCE_API_KEY,
             "secret": BINANCE_API_SECRET,
             "enableRateLimit": True,
         })
-        self.symbols = []
         self.bot = Bot(TG_BOT_TOKEN) if TG_BOT_TOKEN else None
 
-    async def refresh_symbols(self):
-        try:
-            m = await self.ex.load_markets(reload=True)
-            # Hacmi yüksek ilk 50 coini al (Order book maliyetli olduğu için)
-            all_syms = [d for d in m.values() if d.get("quote") == QUOTE and d.get("active")]
-            # Hacme göre sırala
-            sorted_syms = sorted(all_syms, key=lambda x: float(x['info'].get('volume', 0)), reverse=True)
-            self.symbols = [x['symbol'] for x in sorted_syms[:50]] # Sadece top 50
-            log(f"[REFRESH] Top {len(self.symbols)} yüksek hacimli coin izleniyor.")
-        except Exception as e:
-            log(f"[ERR] Refresh: {e}")
+        self.valid_ids = set()
+        self.latest_price = {}
+        self.latest_vol24 = {}
+        self.last_vol24_snapshot = {}
 
-    async def process_symbol(self, symbol: str):
-        try:
-            # 1. MUM VERİLERİ (OHLCV)
-            ohlcv = await self.ex.fetch_ohlcv(symbol, "1m", limit=60)
-            if not ohlcv: return
-            closes = np.array([x[4] for x in ohlcv], dtype=float)
-            
-            # Hızlı Ön Eleme (API Tasarrufu):
-            # Eğer fiyat son 3 dakikada %0.5 oynamadıysa order book çekme.
-            if (max(closes[-3:]) - min(closes[-3:])) / closes[-1] < 0.005:
-                return
+        self.price_buffers = defaultdict(lambda: deque(maxlen=CONTEXT_WINDOW))
+        self.volume_buffers = defaultdict(lambda: deque(maxlen=CONTEXT_WINDOW))
 
-            # 2. ORDER BOOK (Sadece potansiyel varsa çek)
-            ob = await self.ex.fetch_order_book(symbol, limit=20)
-            bids = ob['bids']
-            asks = ob['asks']
+        # sinyal state
+        self.state = {}
 
-            # 3. QUANT ANALİZ
-            q = AdvancedQuantMath.analyze_quantum(closes, bids, asks)
+    async def load_futures_list(self):
+        """USDT-M futures sembollerini çek."""
+        markets = await self.ex.load_markets()
+        for m in markets.values():
+            if m.get("quote") == "USDT" and m.get("active", True):
+                self.valid_ids.add(m["id"])
 
-            if q and q.total_score >= MIN_QUANT_SCORE:
-                # EMOJI VE RENKLER
-                arrow = "🔴 SNIPER SHORT" if q.signal == "SHORT" else "🟢 SNIPER LONG"
-                
-                clean_sym = symbol.replace("/", "")
-                
-                msg = (
-                    f"<b>{arrow} #{clean_sym}</b>\n"
-                    f"Quant Score: <b>{q.total_score:.0f}/100</b>\n"
-                    f"Current Price: <code>{closes[-1]:.4f}</code>\n"
-                    f"Kalman ('True') Price: <code>{q.real_price:.4f}</code>\n\n"
-                    f"<b>🔬 LAB VERİLERİ:</b>\n"
-                    f"• <b>Hurst Exp:</b> <code>{q.hurst:.2f}</code>\n"
-                    f"  <i>(0.5 altı=Dönüş İhtimali, Üstü=Trend)</i>\n"
-                    f"• <b>Kalman Diff:</b> <code>%{q.kalman_diff:.2f}</code>\n"
-                    f"• <b>OrderBook Imbalance:</b> <code>{q.obi:.2f}</code>\n"
-                    f"  <i>(Negatif=Satıcı, Pozitif=Alıcı Baskın)</i>\n"
-                    f"• <b>Acceleration:</b> <code>{q.acceleration:.5f}</code>\n\n"
-                    f"⚠️ <i>Yapay zeka destekli istatistiksel arbitraj sinyali.</i>"
-                )
-                
-                await self.send_telegram(msg)
-                log(f"[SİNYAL] {symbol} Skor: {q.total_score}")
+        for sym in self.valid_ids:
+            self.state[sym] = {
+                "mode": "IDLE",
+                "apex": 0.0,
+                "nadir": 0.0,
+                "cooldown_until": 0.0,
+                "context_mean": 0.0,
+                "context_sigma": 0.0,
+                "locked_sigma": 0.0,
+                "sigma_avg": 0.0,
+                "z_peak": 0.0,
+                "last_signal_ts": 0.0,
+            }
 
-        except Exception as e:
-            pass # Hataları yut (Speed run)
+        log(f"[MARKET] {len(self.valid_ids)} sembol bulundu.")
 
-    async def send_telegram(self, text: str):
-        if self.bot:
-            try:
-                await self.bot.send_message(TG_CHAT_ID, text, parse_mode="HTML")
-            except: pass
-
-    async def run(self):
-        await self.refresh_symbols()
-        log("Quantum Scanner Aktif.")
+    # ==============================
+    # WEBSOCKET: !miniTicker@arr
+    # ==============================
+    async def websocket_loop(self):
         while True:
-            for i in range(0, len(self.symbols), MAX_CONCURRENT_SYMBOLS):
-                batch = self.symbols[i : i + MAX_CONCURRENT_SYMBOLS]
-                tasks = [self.process_symbol(s) for s in batch]
-                await asyncio.gather(*tasks)
-                await asyncio.sleep(1) # Rate limit koruması
-            
-            await asyncio.sleep(SCAN_INTERVAL_SEC)
+            try:
+                async with websockets.connect(
+                    WS_URL,
+                    ping_interval=20,
+                    ping_timeout=20
+                ) as ws:
+                    log("[WS] Bağlandı.")
+                    async for msg in ws:
+                        data = json.loads(msg).get("data")
+                        if not data:
+                            continue
 
+                        for item in data:
+                            sym = item["s"]
+                            if sym not in self.valid_ids:
+                                continue
+
+                            price = float(item["c"])
+                            vol24 = float(item["v"])
+
+                            self.latest_price[sym] = price
+                            self.latest_vol24[sym] = vol24
+
+            except Exception as e:
+                log("[WS ERR]", e)
+                await asyncio.sleep(5)
+
+    # ==============================
+    # AGGREGATION LOOP (1 saniye)
+    # ==============================
+    async def aggregation_loop(self):
+        while True:
+            start = time.time()
+            count = 0
+
+            for sym in list(self.valid_ids):
+                price = self.latest_price.get(sym)
+                if price is None:
+                    continue
+
+                # volume delta
+                vol24 = self.latest_vol24.get(sym, 0.0)
+                prev = self.last_vol24_snapshot.get(sym, vol24)
+                self.last_vol24_snapshot[sym] = vol24
+                delta_vol = max(vol24 - prev, 0.0)
+
+                # append
+                self.price_buffers[sym].append(price)
+                self.volume_buffers[sym].append(delta_vol)
+
+                if len(self.price_buffers[sym]) >= CONTEXT_WINDOW:
+                    count += 1
+                    await self.process_series(
+                        sym,
+                        np.array(self.price_buffers[sym]),
+                        np.array(self.volume_buffers[sym])
+                    )
+
+            log(f"[AGG] {count} sembol işlendi.")
+            elapsed = time.time() - start
+            await asyncio.sleep(max(0.0, 1.0 - elapsed))
+
+    # ==============================
+    # ANA SİNYAL MOTORU
+    # ==============================
+    async def process_series(self, sym, prices, vols):
+        st = self.state[sym]
+        now = time.time()
+
+        if now < st["cooldown_until"]:
+            return
+
+        price = float(prices[-1])
+
+        # -----------------------------
+        # ÖLÜ PİYASA FİLTRESİ
+        # -----------------------------
+        tail = prices[-SIGMA_WINDOW:]
+        rng = (tail.max() - tail.min()) / price * 100
+        if rng < MIN_RANGE_PCT:
+            return
+
+        # -----------------------------
+        # Z + Sigma bağlamı
+        # -----------------------------
+        ctx = prices[-CONTEXT_WINDOW:]
+        z, mean, sigma_ctx = UltimateMath.z_score(ctx, price)
+
+        st["context_mean"] = mean
+        st["context_sigma"] = sigma_ctx
+
+        _, sigma_short = UltimateMath.get_sigma(prices[-SIGMA_WINDOW:])
+
+        # sigma_avg güncelle
+        if st["sigma_avg"] == 0:
+            st["sigma_avg"] = sigma_short
+        else:
+            st["sigma_avg"] = 0.98 * st["sigma_avg"] + 0.02 * sigma_short
+
+        # z_peak
+        abs_z = abs(z)
+        if st["z_peak"] == 0:
+            st["z_peak"] = abs_z
+        else:
+            st["z_peak"] = 0.98 * st["z_peak"] + 0.02 * abs_z
+
+        # -----------------------------
+        # REJİM TESPİTİ (UP / DOWN / CHOP)
+        # -----------------------------
+        sm = UltimateMath.ema(prices)
+        v, a = UltimateMath.get_kinematics(sm)
+        regime = detect_regime(sigma_short, st["sigma_avg"], v, a)
+
+        # Rejime göre strictness ayarı
+        entry_strict = ENTRY_STRICTNESS
+        sig_strict = SIGMA_MOVE_STRICT
+
+        if regime == "HIGH_CHOP":  # çok gürültülü
+            entry_strict *= 1.25
+            sig_strict *= 1.25
+
+        elif regime == "UP_TREND" and a > 0:
+            # LONG için gevşet
+            entry_strict *= 0.85
+
+        elif regime == "DOWN_TREND" and a < 0:
+            # SHORT için gevşet
+            entry_strict *= 0.85
+
+        # -----------------------------
+        # VWAP – eğri – z
+        # -----------------------------
+        vw_prices = prices[-VWAP_WINDOW:]
+        vw_vols = vols[-VWAP_WINDOW:]
+        vwap = UltimateMath.rolling_vwap(vw_prices, vw_vols)
+        vwap_dev = (price - vwap) / vwap * 100
+
+        mode = st["mode"]
+
+        # volatility factor
+        vol_ratio = sigma_short / max(st["sigma_avg"], 1e-8)
+        vol_factor = float(np.clip(vol_ratio, 0.7, 1.5))
+
+        # ================
+        # 1) SHORT START
+        # ================
+        dyn_z = 0.7 * st["z_peak"] + 0.3 * BASE_Z_SCORE_THRESHOLD
+        dyn_z = max(1.8, min(4.0, dyn_z))
+
+        if mode == "IDLE" and z >= dyn_z and vwap_dev >= VWAP_STRETCH_THRESHOLD:
+            st["mode"] = "WATCHING_SHORT"
+            st["apex"] = price
+            st["locked_sigma"] = sigma_short
+            st["nadir"] = float(ctx.min())
+
+        # ================
+        # 1.b SHORT CONFIRM
+        # ================
+        elif mode == "WATCHING_SHORT":
+
+            if price > st["apex"]:
+                st["apex"] = price
+
+            pump_move = st["apex"] - st["nadir"]
+            pump_pct = (pump_move / st["nadir"]) * 100 if st["nadir"] > 0 else 0
+
+            base_req = UltimateMath.get_dynamic_reversal_threshold(pump_pct)
+
+            curve_ok, curv, sl, curr_sl = UltimateMath.poly_curve_signal(
+                prices, "SHORT"
+            )
+
+            final_req = base_req * (CURVE_ACCELERATOR if curve_ok else 1.0)
+            final_req *= entry_strict * vol_factor
+
+            drop_pct = (st["apex"] - price) / st["apex"] * 100
+            drop_sigma = (st["apex"] - price) / max(st["locked_sigma"], 1e-6)
+
+            z_mean_ok = z <= dyn_z * Z_EXIT_BAND
+
+            # -------------------------------
+            # META-LABEL TEST + SİNYAL
+            # -------------------------------
+            if (
+                drop_pct >= final_req and
+                drop_sigma >= sig_strict and
+                a < 0 and
+                z_mean_ok
+            ):
+                ok = await metalabel_confirmation(self, sym, "SHORT")
+                if ok:
+                    await self.send_signal(
+                        sym, "SHORT", price,
+                        z, vwap_dev,
+                        pump_pct, drop_pct, drop_sigma,
+                        curve_ok, curv, curr_sl,
+                        mean, sigma_ctx, sigma_short
+                    )
+                    st["mode"] = "COOLDOWN"
+                    st["cooldown_until"] = now + COOLDOWN_SEC
+                else:
+                    st["mode"] = "IDLE"  # test başarısız → sinyal iptal
+
+        # ================
+        # 2) LONG START
+        # ================
+        if mode == "IDLE" and z <= -dyn_z and vwap_dev <= -VWAP_STRETCH_THRESHOLD:
+            st["mode"] = "WATCHING_LONG"
+            st["nadir"] = price
+            st["apex"] = float(ctx.max())
+            st["locked_sigma"] = sigma_short
+
+        # ================
+        # 2.b LONG CONFIRM
+        # ================
+        elif mode == "WATCHING_LONG":
+
+            if price < st["nadir"]:
+                st["nadir"] = price
+
+            dump_move = st["apex"] - st["nadir"]
+            dump_pct = (dump_move / st["apex"]) * 100 if st["apex"] > 0 else 0
+
+            base_req = UltimateMath.get_dynamic_reversal_threshold(dump_pct)
+
+            curve_ok, curv, sl, curr_sl = UltimateMath.poly_curve_signal(
+                prices, "LONG"
+            )
+
+            final_req = base_req * (CURVE_ACCELERATOR if curve_ok else 1.0)
+            final_req *= entry_strict * vol_factor
+
+            bounce_pct = (price - st["nadir"]) / st["nadir"] * 100
+            bounce_sigma = (price - st["nadir"]) / max(st["locked_sigma"], 1e-6)
+
+            z_mean_ok = z >= -dyn_z * Z_EXIT_BAND
+
+            # -------------------------------
+            # META-LABEL TEST + SİNYAL
+            # -------------------------------
+            if (
+                bounce_pct >= final_req and
+                bounce_sigma >= sig_strict and
+                a > 0 and
+                z_mean_ok
+            ):
+                ok = await metalabel_confirmation(self, sym, "LONG")
+                if ok:
+                    await self.send_signal(
+                        sym, "LONG", price,
+                        z, vwap_dev,
+                        dump_pct, bounce_pct, bounce_sigma,
+                        curve_ok, curv, curr_sl,
+                        mean, sigma_ctx, sigma_short
+                    )
+                    st["mode"] = "COOLDOWN"
+                    st["cooldown_until"] = now + COOLDOWN_SEC
+                else:
+                    st["mode"] = "IDLE"
+
+        # ====================
+        # COOLDOWN'DAN ÇIKIŞ
+        # ====================
+        if (
+            st["mode"] == "COOLDOWN" and
+            now >= st["cooldown_until"] and
+            abs(vwap_dev) < 0.5
+        ):
+            st["mode"] = "IDLE"
+
+    # ==============================
+    # 6) SİNYAL GÖNDERME
+    # ==============================
+    async def send_signal(
+        self, sym, side, price,
+        z, vwap_dev,
+        move_pct, rev_pct, rev_sigma,
+        curve_ok, curvature, curr_sl,
+        mean, sigma_ctx, sigma_short
+    ):
+        if not self.bot:
+            return
+
+        star = "⭐" if abs(z) < 2.5 else "⭐⭐" if abs(z) < 3.5 else "⭐⭐⭐"
+
+        text = (
+            f"📌 <b>M1 Hammer</b>\n"
+            f"{'🔴 SHORT' if side=='SHORT' else '🟢 LONG'} {star}\n"
+            f"• Coin: <b>#{sym}</b>\n"
+            f"• Fiyat: <b>{price:.6f}</b>\n"
+            f"• Z-score: <b>{z:.2f}</b>\n"
+            f"• VWAP Sapma: <b>{vwap_dev:.2f}%</b>\n"
+            f"• Hareket %: <b>{move_pct:.2f}%</b>\n"
+            f"• Dönüş %: <b>{rev_pct:.2f}%</b>\n"
+            f"• Sigma Move: <b>{rev_sigma:.2f}</b>\n"
+            f"• Eğri Hızlandırıcı (Poly): <b>{'EVET 🏎️' if curve_ok else 'Hayır'}</b>\n"
+            f"• Curvature: <b>{curvature:.5f}</b>\n"
+            f"• Son slope: <b>{curr_sl:.5f}</b>\n"
+            f"• Ort. Mean: <b>{mean:.6f}</b>\n"
+            f"• Sigma Context: <b>{sigma_ctx:.6f}</b>\n"
+            f"• Sigma Short: <b>{sigma_short:.6f}</b>"
+        )
+
+        try:
+            await self.bot.send_message(
+                TG_CHAT_ID, text,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            log(f"[SIGNAL] {sym} {side} gönderildi.")
+        except Exception as e:
+            log("[TG ERR]", e)
+
+    # ==============================
+    # 7) RUN
+    # ==============================
+    async def run(self):
+        await self.load_futures_list()
+        await asyncio.gather(
+            self.websocket_loop(),
+            self.aggregation_loop()
+        )
+
+
+# ==============================
+# 9) MAIN
+# ==============================
 if __name__ == "__main__":
-    s = QuantumScanner()
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(s.run())
+    engine = UltimateReversalWS()
+    asyncio.run(engine.run())

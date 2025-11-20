@@ -2,28 +2,54 @@
 # -*- coding: utf-8 -*-
 
 """
-Optuna ile Ultimate Reversal Engine parametre optimizasyonu
-
-- ccxt ile Binance USDT-M futures geçmiş veri (1m) çekilir.
-- TÜM USDT-M futures sembolleri için strateji backtest edilir.
-- Hedef: Toplam PnL / Drawdown oranını MAKSİMİZE etmek.
+ULTIMATE REVERSAL OPTIMIZER - JOBLIB EDITION (STABLE M3 PRO)
+------------------------------------------------------------
+- Yöntem: Joblib 'Loky' Backend
+- Farkı: Kilitlenmeyi önlemek için 'Trial Parallelism' yerine 
+         'Data Parallelism' kullanır.
+- Performans: %100 CPU Kullanımı (Deadlock-Free)
 """
 
 import asyncio
-from typing import Dict, List, Tuple
-
-import optuna
+import time
+import sys
 import numpy as np
 import ccxt.async_support as ccxt_async
+import ccxt
+import optuna
+from tqdm import tqdm
+from joblib import Parallel, delayed
 
+# ============================================================
+# 1) CONFIGURATION
+# ============================================================
 
-# =========================
-# 1) STRATEJİ MATEMATİĞİ
-# =========================
+BINANCE_API_KEY    = "" 
+BINANCE_API_SECRET = ""
+
+# M3 Pro Gücü İçin 50-75 arası idealdir.
+MAX_SYMBOLS        = 50
+TIMEFRAME          = "1m"
+LIMIT_BARS         = 1440 
+
+CONTEXT_WINDOW     = 300
+VWAP_WINDOW        = 120
+SIGMA_WINDOW       = 60
+POLY_WINDOW        = 30
+LOOKAHEAD_SEC      = 60
+
+TOTAL_TRIALS       = 300
+
+MARKET_DATA = {}
+
+# ============================================================
+# 2) MATH ENGINE
+# ============================================================
 
 class UltimateMath:
     @staticmethod
-    def ema(prices: np.ndarray, alpha: float) -> np.ndarray:
+    def ema(prices, alpha):
+        prices = np.array(prices, dtype=float)
         ema = np.zeros_like(prices)
         ema[0] = prices[0]
         for i in range(1, len(prices)):
@@ -31,471 +57,345 @@ class UltimateMath:
         return ema
 
     @staticmethod
-    def rolling_vwap(prices: np.ndarray, volumes: np.ndarray) -> float:
-        pv = np.sum(prices * volumes)
-        vv = np.sum(volumes)
-        if vv == 0:
-            return float(prices[-1])
+    def get_kinematics(prices):
+        v = np.diff(prices)
+        a = np.diff(v)
+        v_curr = float(v[-1]) if len(v) > 0 else 0.0
+        a_curr = float(a[-1]) if len(a) > 0 else 0.0
+        return v_curr, a_curr
+
+    @staticmethod
+    def rolling_vwap(prices, volumes):
+        p = np.array(prices, dtype=float)
+        v = np.array(volumes, dtype=float)
+        pv = np.sum(p * v)
+        vv = np.sum(v)
+        if vv == 0: return float(p[-1])
         return float(pv / vv)
 
     @staticmethod
-    def z_score(window: np.ndarray, current: float):
-        mean = float(window.mean())
-        std = float(window.std())
-        if std == 0:
-            std = max(abs(mean) * 1e-4, 1e-6)
-        z = (current - mean) / std
+    def z_score(window_prices, current_price):
+        mean = np.mean(window_prices)
+        std  = np.std(window_prices)
+        if std < 1e-9: std = 1e-9
+        z = (current_price - mean) / std
         return z, mean, std
 
     @staticmethod
-    def get_sigma(window: np.ndarray):
-        mean = float(window.mean())
-        std = float(window.std())
-        if std == 0:
-            std = max(abs(mean) * 1e-4, 1e-6)
+    def get_sigma(window_prices):
+        mean = np.mean(window_prices)
+        std  = np.std(window_prices)
         return mean, std
 
-    @staticmethod
-    def poly_curve_signal(
-        prices_tail: np.ndarray,
-        side: str,
-        poly_window: int,
-        min_curvature: float
-    ):
-        if len(prices_tail) < poly_window:
-            return False, 0.0, 0.0, 0.0
-        y = prices_tail[-poly_window:]
-        x = np.arange(len(y))
+# ============================================================
+# 3) LOGIC & DATA GEN
+# ============================================================
+
+def detect_regime(sigma_short, sigma_avg, v, a):
+    if sigma_avg <= 0: return "NORMAL"
+    vol_ratio = sigma_short / sigma_avg
+    if vol_ratio > 1.8: return "HIGH_CHOP"
+    if a > 0 and v > 0: return "UP_TREND"
+    if a < 0 and v < 0: return "DOWN_TREND"
+    return "NORMAL"
+
+def generate_synthetic_1s(ohlcv, noise_level=0.0002):
+    ohlcv = np.array(ohlcv, dtype=float)
+    opens, closes, vols = ohlcv[:, 1], ohlcv[:, 4], ohlcv[:, 5]
+    
+    price_chunks, vol_chunks = [], []
+    
+    for o, c, v in zip(opens, closes, vols):
+        base = np.linspace(o, c, 60)
+        ref = max(abs(o), 1.0)
+        noise = np.random.normal(0, noise_level * ref, 60)
+        p_sec = np.maximum(base + noise, 1e-8)
+        v_sec = (v / 60.0) * np.random.uniform(0.8, 1.2, 60)
+        
+        price_chunks.append(p_sec)
+        vol_chunks.append(v_sec)
+        
+    return np.concatenate(price_chunks), np.concatenate(vol_chunks)
+
+async def fetch_data():
+    global MARKET_DATA
+    ex = ccxt_async.binanceusdm({'enableRateLimit': True})
+    markets = await ex.load_markets()
+    
+    symbols = [m["id"] for m in markets.values() if m.get("quote") == "USDT" and m.get("swap", False)]
+    symbols.sort()
+    symbols = symbols[:MAX_SYMBOLS]
+    
+    print(f"[DATA] {len(symbols)} Sembol indiriliyor...")
+    
+    pbar = tqdm(total=len(symbols), desc="İndirme")
+    for sym in symbols:
         try:
-            a, b, c = np.polyfit(x, y, 2)
-        except Exception:
-            return False, 0.0, 0.0, 0.0
-        curvature = a
-        slope = b
-        current_slope = 2 * a * (len(x) - 1) + b
+            ohlcv = await ex.fetch_ohlcv(sym, TIMEFRAME, limit=LIMIT_BARS)
+            if ohlcv and len(ohlcv) > 100:
+                p, v = generate_synthetic_1s(ohlcv)
+                if len(p) > CONTEXT_WINDOW + LOOKAHEAD_SEC:
+                    MARKET_DATA[sym] = {"p": p, "v": v}
+        except: pass
+        pbar.update(1)
+    
+    await ex.close()
+    pbar.close()
 
-        if side == "SHORT":
-            broken = (curvature < -min_curvature) and (current_slope < 0)
-        else:
-            broken = (curvature > min_curvature) and (current_slope > 0)
+# ============================================================
+# 4) SIMULATION (WORKER)
+# ============================================================
 
-        return broken, curvature, slope, current_slope
-
-
-# =========================
-# 2) BASİT BACKTEST
-# =========================
-
-REVERSAL_CONFIRM_PCT_MIN = 0.3   # çok küçük hareketlerde bile en az %0.3 reversal istiyoruz
-
-def get_dynamic_rev(move_pct: float) -> float:
-    abs_move = abs(move_pct)
-    for limit, thr in [
-        (15.0, 0.5),
-        (7.0, 0.8),
-        (3.0, 1.2),
-        (1.5, 1.8),
-    ]:
-        if abs_move >= limit:
-            return max(thr, REVERSAL_CONFIRM_PCT_MIN)
-    return 999.0
-
-
-def backtest_symbol(
-    closes: np.ndarray,
-    volumes: np.ndarray,
-    params: Dict,
-    fee_rate: float = 0.0004,  # takas+komisyon ~0.04%
-    tp_pct: float = 0.003,     # %0.3 TP
-    sl_pct: float = 0.004,     # %0.4 SL
-) -> Dict:
+def simulate_single_symbol(prices, volumes, params):
     """
-    Tek bir sembol için basit long/short backtest.
-    1x notional, sadece yön önemli.
+    Bu fonksiyon Joblib tarafından paralel çalıştırılacak.
     """
-    CONTEXT_WINDOW = params["CONTEXT_WINDOW"]
-    VWAP_WINDOW    = params["VWAP_WINDOW"]
-    SIGMA_WINDOW   = params["SIGMA_WINDOW"]
-    POLY_WINDOW    = params["POLY_WINDOW"]
+    # Parametre Unpack
+    BASE_Z      = params["BASE_Z"]
+    VWAP_STR    = params["VWAP_STR"]
+    SIGMA_STR   = params["SIGMA_STR"]
+    ENTRY_STR   = params["ENTRY_STR"]
+    Z_EXIT      = params["Z_EXIT"]
+    CURV_ACC    = params["CURV_ACC"]
+    MIN_CURV    = params["MIN_CURV"]
+    EMA_AL      = params["EMA_AL"]
+    MIN_RNG     = params["MIN_RNG"]
+    REV_MIN     = params["REV_MIN"]
+    DYN_TH      = params["DYN_TH"]
 
-    BASE_Z             = params["BASE_Z_SCORE_THRESHOLD"]
-    VWAP_DEV           = params["VWAP_STRETCH_THRESHOLD"]
-    SIGMA_MOVE_STRICT  = params["SIGMA_MOVE_STRICT"]
-    ENTRY_STRICTNESS   = params["ENTRY_STRICTNESS"]
-    Z_EXIT_BAND        = params["Z_EXIT_BAND"]
-    CURVE_ACCELERATOR  = params["CURVE_ACCELERATOR"]
-    MIN_CURV           = params["MIN_CURVATURE"]
-    EMA_ALPHA          = params["EMA_ALPHA"]
-    MIN_RANGE_PCT      = params["MIN_RANGE_PCT"]
+    def get_thresh(mpct):
+        am = abs(mpct)
+        for l, t in DYN_TH:
+            if am >= l: return max(t, REV_MIN)
+        return 999.0
 
-    equity = 1.0
-    peak_equity = 1.0
-    dd_max = 0.0
-    trades = 0
-    wins = 0
-    losses = 0
-
-    in_position = False
-    pos_side = None   # "LONG" / "SHORT"
-    entry_price = 0.0
-
+    n = len(prices)
+    # Hızlandırma: Numpy array slicing ile erişim
+    # State
     sigma_avg = 0.0
     z_peak = 0.0
+    mode = 0 # 0:IDLE, 1:SHORT, 2:LONG
+    apex = 0.0
+    nadir = 0.0
+    locked_sigma = 0.0
+    cooldown = 0
+    
+    signals = 0
+    edges = []
 
-    for i in range(CONTEXT_WINDOW, len(closes)):
-        window = closes[i-CONTEXT_WINDOW:i]
-        price = closes[i]
-
-        # ölü market filtresi
-        tail = closes[i-SIGMA_WINDOW:i]
-        r = (tail.max() - tail.min()) / price * 100
-        if r < MIN_RANGE_PCT:
-            if in_position:
-                # basit: bu barı geç
-                pass
+    # Döngü
+    for i in range(CONTEXT_WINDOW, n - LOOKAHEAD_SEC):
+        if cooldown > 0:
+            cooldown -= 1
             continue
 
-        z, ctx_mean, ctx_sigma = UltimateMath.z_score(window, price)
-        _, sigma_short = UltimateMath.get_sigma(closes[i-SIGMA_WINDOW:i])
-
-        # coin volatilite karakteri
-        sigma_avg = sigma_short if sigma_avg == 0 else 0.98*sigma_avg + 0.02*sigma_short
-        abs_z = abs(z)
-        z_peak = abs_z if z_peak == 0 else 0.98*z_peak + 0.02*abs_z
-
-        # dinamik Z threshold
-        dyn_z_th = 0.7 * z_peak + 0.3 * BASE_Z
-        dyn_z_th = max(1.8, min(4.0, dyn_z_th))
-
-        vwap = UltimateMath.rolling_vwap(
-            closes[i-VWAP_WINDOW:i], volumes[i-VWAP_WINDOW:i]
-        )
-
-        smooth = UltimateMath.ema(closes[i-CONTEXT_WINDOW:i], EMA_ALPHA)
-        v = np.diff(smooth)
-        a_arr = np.diff(v)
-        a = a_arr[-1] if len(a_arr) else 0.0
-
-        vwap_dev_pct = (price - vwap) / vwap * 100
-
-        # trade açıkken önce TP/SL kontrolü
-        if in_position:
-            high = price
-            low  = price
-
-            if pos_side == "LONG":
-                tp = entry_price * (1 + tp_pct)
-                sl = entry_price * (1 - sl_pct)
-                exit_price = None
-                if low <= sl:
-                    exit_price = sl
-                elif high >= tp:
-                    exit_price = tp
-
-                if exit_price:
-                    pnl = (exit_price / entry_price - 1) - fee_rate*2
-                    equity *= (1 + pnl)
-                    in_position = False
-                    trades += 1
-                    if pnl > 0:
-                        wins += 1
-                    else:
-                        losses += 1
-
-            elif pos_side == "SHORT":
-                tp = entry_price * (1 - tp_pct)
-                sl = entry_price * (1 + sl_pct)
-                exit_price = None
-                if high >= sl:
-                    exit_price = sl
-                elif low <= tp:
-                    exit_price = tp
-
-                if exit_price:
-                    pnl = (entry_price / exit_price - 1) - fee_rate*2
-                    equity *= (1 + pnl)
-                    in_position = False
-                    trades += 1
-                    if pnl > 0:
-                        wins += 1
-                    else:
-                        losses += 1
-
-            peak_equity = max(peak_equity, equity)
-            dd = (peak_equity - equity) / peak_equity
-            dd_max = max(dd_max, dd)
-
-            # pozisyon açıksa yeni sinyal aramıyoruz
+        p_curr = prices[i]
+        
+        # 1. Range Filtresi
+        tail = prices[i-SIGMA_WINDOW:i]
+        if (tail.max() - tail.min()) / p_curr * 100 < MIN_RNG:
             continue
 
-        # pozisyon yoksa sinyal arıyoruz
+        # 2. Context
+        ctx = prices[i-CONTEXT_WINDOW:i]
+        z, _, _ = UltimateMath.z_score(ctx, p_curr)
+        _, sigma_s = UltimateMath.get_sigma(tail)
 
-        # vol ratio → çok volatilse daha sert reversal iste
-        vol_ratio = sigma_short / sigma_avg if sigma_avg > 0 else 1.0
-        vol_factor = float(np.clip(vol_ratio, 0.7, 1.5))
+        # State update
+        if sigma_avg == 0: sigma_avg = sigma_s
+        else: sigma_avg = 0.98*sigma_avg + 0.02*sigma_s
+        
+        abz = abs(z)
+        if z_peak == 0: z_peak = abz
+        else: z_peak = 0.98*z_peak + 0.02*abz
 
-        # PUMP (SHORT)
-        if z >= dyn_z_th and vwap_dev_pct >= VWAP_DEV:
-            apex = price
-            nadir = window.min()
-            pump_move = apex - nadir
-            pump_pct = (pump_move / nadir) * 100 if nadir > 0 else 0.0
+        # 3. Regime
+        sm = UltimateMath.ema(ctx, EMA_AL)
+        v, a = UltimateMath.get_kinematics(sm)
+        regime = detect_regime(sigma_s, sigma_avg, v, a)
+        
+        estr = ENTRY_STR
+        sstr = SIGMA_STR
+        if regime == "HIGH_CHOP": estr *= 1.25; sstr *= 1.25
+        elif regime == "UP_TREND" and a > 0: estr *= 0.85
+        elif regime == "DOWN_TREND" and a < 0: estr *= 0.85
 
-            base_rev = get_dynamic_rev(pump_pct)
-            curve_broken, curv, slope, cur_slope = UltimateMath.poly_curve_signal(
-                closes[i-CONTEXT_WINDOW:i], "SHORT", POLY_WINDOW, MIN_CURV
-            )
-            final_rev = base_rev * (CURVE_ACCELERATOR if curve_broken else 1.0)
-            final_rev *= ENTRY_STRICTNESS * vol_factor
+        # 4. VWAP
+        vp = prices[i-VWAP_WINDOW:i]
+        vv = volumes[i-VWAP_WINDOW:i]
+        vwap = UltimateMath.rolling_vwap(vp, vv)
+        vdev = (p_curr - vwap)/vwap*100
 
-            if i+1 >= len(closes):
-                break
-            future_price = closes[i+1]
-            drop_pct = (apex - future_price) / apex * 100
-            drop_sigma = (apex - future_price) / max(sigma_short, 1e-6)
+        # Factors
+        vfact = np.clip(sigma_s/max(sigma_avg, 1e-9), 0.7, 1.5)
+        dyn_z = max(1.8, min(4.0, 0.7*z_peak + 0.3*BASE_Z))
 
-            z_next, *_ = UltimateMath.z_score(window, future_price)
-            z_back = z_next <= dyn_z_th * Z_EXIT_BAND
+        # --- LOGIC ---
+        # SHORT
+        if mode == 0 and z >= dyn_z and vdev >= VWAP_STR:
+            mode = 1
+            apex = p_curr
+            locked_sigma = sigma_s
+            nadir = ctx.min()
+        
+        elif mode == 1: # Watch Short
+            if p_curr > apex: apex = p_curr
+            
+            pump = ((apex-nadir)/nadir*100) if nadir>0 else 0
+            req = get_thresh(pump)
+            
+            # Curve check
+            cok = False
+            if i >= POLY_WINDOW:
+                try:
+                    y = prices[i-POLY_WINDOW:i]
+                    x = np.arange(len(y))
+                    a2, b2, _ = np.polyfit(x, y, 2)
+                    sl = 2*a2*(len(x)-1)+b2
+                    if a2 < -MIN_CURV and sl < 0: cok = True
+                except: pass
+            
+            freq = req * (CURV_ACC if cok else 1.0) * estr * vfact
+            drop = (apex - p_curr)/apex*100
+            d_sig = (apex - p_curr)/max(locked_sigma, 1e-9)
+            
+            if drop >= freq and d_sig >= sstr and a < 0 and z <= dyn_z*Z_EXIT:
+                # Meta-label check (Offline)
+                fut = prices[i+1:i+1+6]
+                if len(fut)>0 and fut.min() < p_curr: # Success
+                    future_deep = prices[i+1:i+1+LOOKAHEAD_SEC]
+                    edge = (apex - future_deep.min())/apex*100
+                    edges.append(edge)
+                    signals += 1
+                    mode = 0
+                    cooldown = 30
+                else:
+                    mode = 0
 
-            if (
-                drop_pct >= final_rev and
-                drop_sigma >= SIGMA_MOVE_STRICT and
-                a < 0 and
-                z_back
-            ):
-                in_position = True
-                pos_side = "SHORT"
-                entry_price = future_price
-                equity *= (1 - fee_rate)
+        # LONG
+        if mode == 0 and z <= -dyn_z and vdev <= -VWAP_STR:
+            mode = 2
+            nadir = p_curr
+            apex = ctx.max()
+            locked_sigma = sigma_s
+            
+        elif mode == 2: # Watch Long
+            if p_curr < nadir: nadir = p_curr
+            dump = ((apex-nadir)/apex*100) if apex>0 else 0
+            req = get_thresh(dump)
+            
+            cok = False
+            if i >= POLY_WINDOW:
+                try:
+                    y = prices[i-POLY_WINDOW:i]
+                    x = np.arange(len(y))
+                    a2, b2, _ = np.polyfit(x, y, 2)
+                    sl = 2*a2*(len(x)-1)+b2
+                    if a2 > MIN_CURV and sl > 0: cok = True
+                except: pass
 
-        # DUMP (LONG)
-        elif z <= -dyn_z_th and vwap_dev_pct <= -VWAP_DEV:
-            nadir = price
-            apex = window.max()
-            dump_move = apex - nadir
-            dump_pct = (dump_move / apex) * 100 if apex > 0 else 0.0
+            freq = req * (CURV_ACC if cok else 1.0) * estr * vfact
+            bounce = (p_curr - nadir)/nadir*100
+            b_sig = (p_curr - nadir)/max(locked_sigma, 1e-9)
+            
+            if bounce >= freq and b_sig >= sstr and a > 0 and z >= -dyn_z*Z_EXIT:
+                fut = prices[i+1:i+1+6]
+                if len(fut)>0 and fut.max() > p_curr:
+                    future_deep = prices[i+1:i+1+LOOKAHEAD_SEC]
+                    edge = (future_deep.max() - nadir)/nadir*100
+                    edges.append(edge)
+                    signals += 1
+                    mode = 0
+                    cooldown = 30
+                else:
+                    mode = 0
 
-            base_bounce = get_dynamic_rev(dump_pct)
-            curve_broken, curv, slope, cur_slope = UltimateMath.poly_curve_signal(
-                closes[i-CONTEXT_WINDOW:i], "LONG", POLY_WINDOW, MIN_CURV
-            )
-            final_bounce = base_bounce * (CURVE_ACCELERATOR if curve_broken else 1.0)
-            final_bounce *= ENTRY_STRICTNESS * vol_factor
+    return signals, edges
 
-            if i+1 >= len(closes):
-                break
-            future_price = closes[i+1]
-            bounce_pct = (future_price - nadir) / nadir * 100
-            bounce_sigma = (future_price - nadir) / max(sigma_short, 1e-6)
+# ============================================================
+# 5) OPTUNA OBJECTIVE (JOBLIB WRAPPER)
+# ============================================================
 
-            z_next, *_ = UltimateMath.z_score(window, future_price)
-            z_back = z_next >= -dyn_z_th * Z_EXIT_BAND
-
-            if (
-                bounce_pct >= final_bounce and
-                bounce_sigma >= SIGMA_MOVE_STRICT and
-                a > 0 and
-                z_back
-            ):
-                in_position = True
-                pos_side = "LONG"
-                entry_price = future_price
-                equity *= (1 - fee_rate)
-
-        peak_equity = max(peak_equity, equity)
-        dd = (peak_equity - equity) / peak_equity
-        dd_max = max(dd_max, dd)
-
-    return {
-        "equity": equity,
-        "dd_max": dd_max,
-        "trades": trades,
-        "wins": wins,
-        "losses": losses,
+def objective(trial):
+    # Parametreleri hazırla
+    params = {
+        "BASE_Z": trial.suggest_float("BASE_Z", 1.8, 3.5),
+        "VWAP_STR": trial.suggest_float("VWAP_STR", 0.8, 3.0),
+        "SIGMA_STR": trial.suggest_float("SIGMA_STR", 1.0, 3.0),
+        "ENTRY_STR": trial.suggest_float("ENTRY_STR", 1.0, 2.2),
+        "Z_EXIT": trial.suggest_float("Z_EXIT", 0.1, 0.7),
+        "CURV_ACC": trial.suggest_float("CURV_ACC", 0.3, 1.5),
+        "MIN_CURV": trial.suggest_float("MIN_CURV", 1e-5, 1e-3, log=True),
+        "EMA_AL": trial.suggest_float("EMA_AL", 0.05, 0.4),
+        "MIN_RNG": trial.suggest_float("MIN_RNG", 0.1, 1.5),
+        "REV_MIN": trial.suggest_float("REV_MIN", 0.1, 1.0),
     }
+    t1 = trial.suggest_float("DT1", 0.3, 1.0)
+    t2 = trial.suggest_float("DT2", 0.5, 1.5)
+    t3 = trial.suggest_float("DT3", 0.8, 2.0)
+    t4 = trial.suggest_float("DT4", 1.0, 2.5)
+    params["DYN_TH"] = [(15.0, t1),(7.0, t2),(3.0, t3),(1.5, t4)]
+    
+    if not MARKET_DATA: return -9999.0
 
-
-# =========================
-# 3) TÜM FUTURES SEMBOLLERİ + DATA ÇEKME
-# =========================
-
-async def pick_all_futures_symbols() -> List[str]:
-    """
-    Binance USDM'den TÜM USDT-M perpetual kontrat sembollerini döndür.
-    """
-    ex = ccxt_async.binanceusdm({"enableRateLimit": True})
-    markets = await ex.load_markets()
-    symbols: List[str] = []
-
-    for sym, m in markets.items():
-        # sadece USDT-M perpetual (quote=USDT ve contract=True)
-        if m.get("quote") == "USDT" and m.get("contract", False):
-            symbols.append(sym)
-
-    await ex.close()
-
-    symbols = sorted(symbols)  # sırala, sadece düzen olsun
-    print(f"Toplam USDT-M futures sayısı: {len(symbols)}")
-    print(symbols)
-    return symbols
-
-
-async def fetch_data_for_symbols(
-    symbols: List[str],
-    timeframe: str = "1m",
-    per_symbol_limit: int = 10_000,   # her coin için hedef bar sayısı (10000 = ~1 hafta 1m)
-) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
-    """
-    Binance USDM'den her sembol için ~per_symbol_limit kadar 1m mum çeker.
-    fetch_ohlcv limit kısıtlarını aşmak için pagination yapar.
-    DİKKAT: Tüm coinler + çok büyük per_symbol_limit çok ağır olur.
-    """
-    ex = ccxt_async.binanceusdm({"enableRateLimit": True})
-    out: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
-
-    tf_ms = 60_000   # 1m
-    max_chunk = 1000
-    print(f"{len(symbols)} sembol için yaklaşık {per_symbol_limit} bar çekilecek...")
-
-    for idx, sym in enumerate(symbols, start=1):
-        try:
-            print(f"[{idx}/{len(symbols)}] [DATA] {sym} için veri çekiliyor...")
-            all_ohlcv: List[List[float]] = []
-
-            now = ex.milliseconds()
-            since = now - per_symbol_limit * tf_ms
-
-            while True:
-                ohlcv = await ex.fetch_ohlcv(
-                    sym,
-                    timeframe,
-                    since=since,
-                    limit=max_chunk
-                )
-                if not ohlcv:
-                    break
-
-                all_ohlcv.extend(ohlcv)
-
-                last_ts = ohlcv[-1][0]
-                since = last_ts + tf_ms
-
-                if len(all_ohlcv) >= per_symbol_limit:
-                    break
-
-                await asyncio.sleep(0.05)
-
-            if len(all_ohlcv) == 0:
-                print(f"[DATA] {sym}: veri alınamadı, atlanıyor.")
-                continue
-
-            all_ohlcv = all_ohlcv[-per_symbol_limit:]
-
-            closes = np.array([x[4] for x in all_ohlcv], dtype=float)
-            vols   = np.array([x[5] for x in all_ohlcv], dtype=float)
-
-            # Çok az bar varsa (ör: yeni açılmış kontrat), çöpe at
-            if len(closes) < 200:
-                print(f"[DATA] {sym}: yeterli veri yok ({len(closes)} bar), atlanıyor.")
-                continue
-
-            out[sym] = (closes, vols)
-            print(f"[DATA] {sym}: {len(closes)} bar alındı.")
-
-        except Exception as e:
-            print(f"[DATA ERR] {sym}: {e}")
-            continue
-
-    await ex.close()
-    print("Veri çekme bitti.")
-    return out
-
-
-# =========================
-# 4) OPTUNA OBJECTIVE
-# =========================
-
-HISTORY_CACHE: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}  # global cache: symbol -> (closes, vols)
-
-
-def create_params_from_trial(trial: optuna.Trial) -> Dict:
-    return {
-        "CONTEXT_WINDOW": 200,
-        "VWAP_WINDOW": 60,
-        "SIGMA_WINDOW": 30,
-        "POLY_WINDOW": 20,
-
-        "BASE_Z_SCORE_THRESHOLD": trial.suggest_float("BASE_Z", 2.0, 4.0),
-        "VWAP_STRETCH_THRESHOLD": trial.suggest_float("VWAP_DEV", 0.3, 2.0),
-        "SIGMA_MOVE_STRICT":      trial.suggest_float("SIGMA_MOVE", 0.8, 2.0),
-        "ENTRY_STRICTNESS":       trial.suggest_float("ENTRY_STRICT", 1.0, 1.6),
-        "Z_EXIT_BAND":            trial.suggest_float("Z_EXIT_BAND", 0.3, 0.7),
-        "CURVE_ACCELERATOR":      trial.suggest_float("CURVE_ACCEL", 0.4, 0.9),
-        "MIN_CURVATURE":          trial.suggest_float("MIN_CURV", 0.00002, 0.0002),
-        "EMA_ALPHA":              trial.suggest_float("EMA_ALPHA", 0.1, 0.4),
-        "MIN_RANGE_PCT":          trial.suggest_float("MIN_RANGE", 0.1, 0.5),
-    }
-
-
-def objective(trial: optuna.Trial) -> float:
-    params = create_params_from_trial(trial)
-
-    symbols = list(HISTORY_CACHE.keys())
-    if not symbols:
-        return 0.0
-
-    total_equity = 0.0
-    total_dd = 0.0
-    total_trades = 0
-
-    for sym in symbols:
-        closes, vols = HISTORY_CACHE[sym]
-        res = backtest_symbol(closes, vols, params)
-        total_equity += res["equity"]
-        total_dd += res["dd_max"]
-        total_trades += res["trades"]
-
-    if total_trades == 0:
-        return 0.0
-
-    avg_equity = total_equity / len(symbols)
-    avg_dd = total_dd / max(len(symbols), 1)
-
-    # skor: (getiri / drawdown), trade azsa cezalandır
-    reward = (avg_equity - 1.0) / max(avg_dd, 0.01)
-    reward *= min(1.0, total_trades / 100)  # çok az trade ise etkisini azalt
-
-    return reward
-
-
-# =========================
-# 5) ANA ÇALIŞTIRICI
-# =========================
-
-async def main():
-    global HISTORY_CACHE
-
-    print("TÜM USDT-M futures semboller çekiliyor...")
-    symbols = await pick_all_futures_symbols()
-
-    print("Veri çekiliyor...")
-    HISTORY_CACHE = await fetch_data_for_symbols(
-        symbols,
-        timeframe="1m",
-        per_symbol_limit=10_000,   # istersen burayı sonra yukarı çekersin
+    # --- PARALLEL EXECUTION ---
+    # Optuna'nın kendisi yerine, hesaplamayı Joblib ile dağıtıyoruz.
+    # n_jobs=-1 : Tüm çekirdekleri kullan
+    # backend='loky': En kararlı backend (Deadlock proof)
+    
+    results = Parallel(n_jobs=-1, backend="loky")(
+        delayed(simulate_single_symbol)(
+            MARKET_DATA[sym]["p"], 
+            MARKET_DATA[sym]["v"], 
+            params
+        ) for sym in MARKET_DATA
     )
-    print("Toplanan sembol sayısı (yeterli datası olan):", len(HISTORY_CACHE))
+    
+    # Sonuçları topla
+    total_signals = 0
+    all_edges = []
+    
+    for sigs, edges in results:
+        total_signals += sigs
+        all_edges.extend(edges)
+        
+    if total_signals == 0 or not all_edges:
+        return -1.0
+        
+    avg_edge = np.mean(all_edges)
+    score = avg_edge * np.log(1 + total_signals)
+    if avg_edge < 0: score -= 50.0
+    
+    return score
 
-    def obj(trial: optuna.Trial) -> float:
-        return objective(trial)
-
-    study = optuna.create_study(direction="maximize")
-    study.optimize(obj, n_trials=50)   # burayı da sonra artırırsın (100, 200, ...)
-
-    print("En iyi değerler:")
-    print(study.best_params)
-    print("En iyi skor:", study.best_value)
-
+# ============================================================
+# 6) MAIN
+# ============================================================
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    print("[MAIN] Veri hazırlanıyor...")
+    try:
+        loop = asyncio.get_running_loop()
+    except:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+    loop.run_until_complete(fetch_data())
+    
+    if not MARKET_DATA:
+        print("Veri Yok!")
+        sys.exit(1)
+        
+    print(f"[MAIN] Optuna Başlıyor (Joblib Backend ile)...")
+    print(f"[INFO] M3 Pro'nun tüm çekirdekleri hesaplama anında aktif olacak.")
+    
+    study = optuna.create_study(direction="maximize")
+    
+    # DİKKAT: Optuna'ya n_jobs=1 diyoruz, çünkü paralelleştirmeyi içeride Joblib yapıyor.
+    # Bu yöntem kilitlenmeyi %100 çözer.
+    study.optimize(objective, n_trials=TOTAL_TRIALS, n_jobs=1, show_progress_bar=True)
+    
+    print("\n" + "="*60)
+    print("🏆 SONUÇLAR")
+    print(f"Skor: {study.best_value}")
+    print(study.best_params)
