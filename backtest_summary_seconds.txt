@@ -1,0 +1,16 @@
+===== SECOND-LEVEL MULTI-SYMBOL BACKTEST SUMMARY =====
+Toplam işlem sayısı : 2
+Kazanan işlem sayısı: 1
+Kaybeden işlem sayısı: 1
+Winrate           : 50.00%
+
+Ortalama PnL (trade başına) : 0.043%
+Kümülatif PnL (toplam)      : 0.087%
+Maksimum kazanç (PnL %)     : 0.087%
+Maksimum kayıp (PnL %)      : 0.000%
+
+— Sembol Bazlı Performans —
+                count     mean      sum
+symbol                                 
+NXPC/USDT:USDT      1  0.08658  0.08658
+SAGA/USDT:USDT      1  0.00000  0.00000

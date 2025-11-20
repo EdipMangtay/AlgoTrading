@@ -2,22 +2,28 @@
 # -*- coding: utf-8 -*-
 
 """
-ULTIMATE REVERSAL ENGINE (WebSocket Edition, Dynamic Per-Coin)
---------------------------------------------------------------
+ULTIMATE REVERSAL ENGINE (WebSocket Edition, Dynamic Per-Coin, Enhanced + RSI Divergence)
+-----------------------------------------------------------------------------------------
 - Veri: Binance USDT-M Futures WebSocket (!miniTicker@arr)
-- Zaman çözünürlüğü: 1s custom close serisi
-- Strateji: VWAP + Z-Score + Sigma + Polynomial Curve + EMA Kinematics
-- SHORT: Pump sonrası tepeden dönüş
-- LONG : Dump sonrası dipten tepki
+- Zaman çözünürlüğü: 1s custom close serisi + 1s OHLC mumları
+- Strateji: VWAP + Z-Score + Sigma + Polynomial Curve + EMA Kinematics + RSI Divergence
+- SHORT: Pump sonrası tepeden dönüş (bearish RSI uyumsuzluk + wick)
+- LONG : Dump sonrası dipten tepki (bullish RSI uyumsuzluk + wick)
 
-Dinamik Özellikler:
+Ek Özellikler:
 - Her coin için ayrı:
   - Z-score eşiği (z_peak'e göre adaptif)
   - Volatilite profili (sigma_avg) → reversal yüzdesi buna göre sertleşir/yumuşar
+- Likidite filtresi (24h volume)
+- Trend filtresi (context EMA fast / EMA slow)
+- Z-score debounce (en az birkaç saniye eşik üstü/altı)
+- Wick teyidi (3s pseudo mum, üst/alt fitil yapısı)
+- Smooth RSI + akıllı uyumsuzluk filtresi (divergence confirmation)
 """
 
 import asyncio
 import json
+import os
 import time
 from collections import defaultdict, deque
 
@@ -68,8 +74,23 @@ DYNAMIC_THRESHOLDS = [
 ]
 
 COOLDOWN_SEC       = 90      # sinyal sonrası aynı sembolde bekleme
+WS_URL             = "wss://fstream.binance.com/stream?streams=!miniTicker@arr"
 
-WS_URL = "wss://fstream.binance.com/stream?streams=!miniTicker@arr"
+# Likidite filtresi (24h volume - USDT)
+MIN_24H_VOL_USDT   = 10_000_000
+
+# Volatilite rejimi eşikleri
+LOW_SIGMA_TH       = 0.0005   # çok sakin market → sinyal üretme
+HIGH_SIGMA_TH      = 0.02     # aşırı manyak market → daha sıkı giriş
+
+# Z-score debounce ayarları
+Z_DEBOUNCE_LEN     = 5        # son 5 saniye
+Z_DEBOUNCE_COUNT   = 3        # en az 3 tanesi eşik üstü/altı olmalı
+
+# RSI ayarları
+RSI_PERIOD         = 14
+RSI_SMOOTH_ALPHA   = 0.2      # RSI çıktısını ekstra EMA ile yumuşatma
+RSI_LOOKBACK       = 120      # uyumsuzluk için bakılan pencere (saniye)
 
 
 def log(*args):
@@ -84,6 +105,8 @@ class UltimateMath:
     @staticmethod
     def ema(prices, alpha=EMA_ALPHA):
         prices = np.array(prices, dtype=float)
+        if len(prices) == 0:
+            return prices
         ema = np.zeros_like(prices)
         ema[0] = prices[0]
         for i in range(1, len(prices)):
@@ -161,6 +184,125 @@ class UltimateMath:
 
         return broken, curvature, slope, current_slope
 
+    # ---------- RSI + DIVERGENCE ----------
+
+    @staticmethod
+    def rsi(prices, period=RSI_PERIOD, smooth_alpha=RSI_SMOOTH_ALPHA):
+        """
+        Classic RSI (14) + ekstra EMA smoothing.
+        Output: prices ile aynı uzunlukta array (baş taraf low-informative olabilir).
+        """
+        arr = np.array(prices, dtype=float)
+        n = len(arr)
+        if n <= period:
+            return np.zeros_like(arr)
+
+        deltas = np.diff(arr)
+        gains = np.where(deltas > 0, deltas, 0.0)
+        losses = np.where(deltas < 0, -deltas, 0.0)
+
+        avg_gain = np.zeros(n)
+        avg_loss = np.zeros(n)
+
+        # ilk period için basit ortalama
+        avg_gain[period] = gains[:period].mean()
+        avg_loss[period] = losses[:period].mean()
+
+        # Wilder smoothing
+        for i in range(period + 1, n):
+            avg_gain[i] = (avg_gain[i - 1] * (period - 1) + gains[i - 1]) / period
+            avg_loss[i] = (avg_loss[i - 1] * (period - 1) + losses[i - 1]) / period
+
+        rs = np.divide(
+            avg_gain,
+            avg_loss,
+            out=np.zeros_like(avg_gain),
+            where=avg_loss != 0
+        )
+        rsi = 100 - (100 / (1.0 + rs))
+
+        # ekstra smoothing (EMA)
+        smooth = np.zeros_like(rsi)
+        smooth[0] = rsi[0]
+        for i in range(1, n):
+            smooth[i] = smooth_alpha * rsi[i] + (1 - smooth_alpha) * smooth[i - 1]
+
+        return smooth
+
+    @staticmethod
+    def detect_rsi_divergence(prices, rsi_values, side, lookback=RSI_LOOKBACK):
+        """
+        RSI uyumsuzluk (divergence) tespiti.
+        - side="SHORT": Bearish divergence
+            * Fiyat: HH (higher high)
+            * RSI  : LH (lower high)
+            * RSI ikinci tepede yüksek bölgede (ör: > 55)
+        - side="LONG": Bullish divergence
+            * Fiyat: LL (lower low)
+            * RSI  : HL (higher low)
+            * RSI ikinci dipte düşük bölgede (ör: < 45)
+
+        Dönen:
+            (bool divergence_var_mi, dict info | None)
+        """
+        p = np.array(prices, dtype=float)
+        r = np.array(rsi_values, dtype=float)
+        if len(p) < lookback + 3:
+            return False, None
+
+        p = p[-lookback:]
+        r = r[-lookback:]
+        n = len(p)
+
+        highs = []
+        lows = []
+
+        # basit local swing high / low (1-bar neighbor)
+        for i in range(1, n - 1):
+            if p[i] >= p[i - 1] and p[i] >= p[i + 1]:
+                highs.append(i)
+            if p[i] <= p[i - 1] and p[i] <= p[i + 1]:
+                lows.append(i)
+
+        if side == "SHORT":
+            # Bearish divergence: HH in price, LH in RSI
+            if len(highs) < 2:
+                return False, None
+            i1, i2 = highs[-2], highs[-1]
+            p1, p2 = p[i1], p[i2]
+            r1, r2 = r[i1], r[i2]
+
+            # fiyat net higher high + RSI net lower high + RSI yüksek bölgede
+            price_hh = p2 > p1 * 1.001
+            rsi_lh   = r2 < r1 - 1.0
+            rsi_high_zone = r2 > 55
+
+            ok = price_hh and rsi_lh and rsi_high_zone
+            info = {
+                "p1": float(p1), "p2": float(p2),
+                "r1": float(r1), "r2": float(r2),
+            }
+            return ok, info
+
+        else:  # LONG
+            # Bullish divergence: LL in price, HL in RSI
+            if len(lows) < 2:
+                return False, None
+            i1, i2 = lows[-2], lows[-1]
+            p1, p2 = p[i1], p[i2]
+            r1, r2 = r[i1], r[i2]
+
+            price_ll = p2 < p1 * 0.999
+            rsi_hl   = r2 > r1 + 1.0
+            rsi_low_zone = r2 < 45
+
+            ok = price_ll and rsi_hl and rsi_low_zone
+            info = {
+                "p1": float(p1), "p2": float(p2),
+                "r1": float(r1), "r2": float(r2),
+            }
+            return ok, info
+
 
 # ==============================
 # 3) WEBSOCKET + ENGINE
@@ -186,8 +328,15 @@ class UltimateReversalWS:
         self.volume_buffers = defaultdict(lambda: deque(maxlen=CONTEXT_WINDOW))
 
         # state: coin karakteri + sinyal durumu
-        # mode, apex, nadir, cooldown, context_mean/sigma, locked_sigma, sigma_avg, z_peak, last_signal_ts
+        # mode, apex, nadir, cooldown, context_mean/sigma, locked_sigma, sigma_avg, z_peak, last_signal_ts, last_rsi
         self.state = {}
+
+        # Z-score debounce için
+        self.z_history = defaultdict(lambda: deque(maxlen=Z_DEBOUNCE_LEN))
+
+        # 1s OHLC üretimi için
+        self.ohlc_1s_current = {}   # sym_id -> {"ts", "open", "high", "low", "close"}
+        self.ohlc_1s_history = defaultdict(lambda: deque(maxlen=60))  # son 60 saniye
 
     async def load_futures_list(self):
         """Tüm USDT-M futures id’lerini yükle."""
@@ -209,9 +358,62 @@ class UltimateReversalWS:
                 "sigma_avg": 0.0,   # coin'in tipik 60sn sigma ortalaması
                 "z_peak": 0.0,      # coin'in tipik max |z|
                 "last_signal_ts": 0.0,
+                "last_rsi": 0.0,
             }
 
         log(f"[MARKETS] USDT-M futures sayısı: {len(self.valid_ids)}")
+
+    # ---------- 1s OHLC HELPER ----------
+
+    def _update_ohlc_1s(self, sym_id, price):
+        now_sec = int(time.time())
+        bar = self.ohlc_1s_current.get(sym_id)
+
+        if bar is None or bar["ts"] != now_sec:
+            # eski bar'ı history'e it
+            if bar is not None:
+                self.ohlc_1s_history[sym_id].append(bar)
+            # yeni bar başlat
+            self.ohlc_1s_current[sym_id] = {
+                "ts": now_sec,
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+            }
+        else:
+            # aynı saniye içindeyiz, high/low/close güncelle
+            bar["high"] = max(bar["high"], price)
+            bar["low"] = min(bar["low"], price)
+            bar["close"] = price
+
+    def _check_wick(self, sym_id, side, window_sec=3):
+        """Son window_sec 1s mumundan pseudo 3s mum üret ve wick teyidi yap."""
+        bars = self.ohlc_1s_history[sym_id]
+        if len(bars) < window_sec:
+            return False
+
+        recent = list(bars)[-window_sec:]
+        open_ = recent[0]["open"]
+        close_ = recent[-1]["close"]
+        high = max(b["high"] for b in recent)
+        low = min(b["low"] for b in recent)
+
+        body = abs(close_ - open_)
+        range_ = max(high - low, 1e-12)
+
+        upper_wick = high - max(open_, close_)
+        lower_wick = min(open_, close_) - low
+
+        # fitil gövdenin en az 2 katı ve total range'in anlamlı kısmı olsun
+        if side == "SHORT":
+            if upper_wick > body * 2 and upper_wick > range_ * 0.4:
+                return True
+        else:  # LONG
+            if lower_wick > body * 2 and lower_wick > range_ * 0.4:
+                return True
+
+        return False
 
     # ---------- WEBSOCKET LOOP ----------
 
@@ -238,6 +440,9 @@ class UltimateReversalWS:
                             vol24 = float(item["v"])
                             self.latest_price[sym_id] = price
                             self.latest_vol24[sym_id] = vol24
+
+                            # 1s OHLC güncelle
+                            self._update_ohlc_1s(sym_id, price)
             except Exception as e:
                 log("[WS ERR]", e)
                 log("[WS] 5 sn sonra yeniden bağlanmayı deneyecek...")
@@ -256,7 +461,11 @@ class UltimateReversalWS:
                 if price is None:
                     continue
 
+                # Likidite filtresi (24h volume)
                 vol24 = self.latest_vol24.get(sym_id, 0.0)
+                if vol24 < MIN_24H_VOL_USDT:
+                    continue
+
                 prev24 = self.last_vol24_snapshot.get(sym_id, vol24)
                 delta_vol = max(vol24 - prev24, 0.0)
                 self.last_vol24_snapshot[sym_id] = vol24
@@ -287,18 +496,21 @@ class UltimateReversalWS:
 
         current_price = float(prices[-1])
 
-        # Ölü piyasa filtresi
+        # Ölü piyasa filtresi (son 60 saniye range)
         tail = prices[-SIGMA_WINDOW:]
         price_range_pct = (tail.max() - tail.min()) / current_price * 100
         if price_range_pct < MIN_RANGE_PCT:
             return
 
-        # Bağlam
+        # Bağlam penceresi
         context_window = prices[-CONTEXT_WINDOW:]
+
+        # Z-score + context sigma
         z, ctx_mean, ctx_sigma = UltimateMath.z_score(context_window, current_price)
         st["context_mean"] = ctx_mean
         st["context_sigma"] = ctx_sigma
 
+        # Local sigma
         _, sigma_short = UltimateMath.get_sigma(prices[-SIGMA_WINDOW:])
 
         # Coin'in volatilite profili (running EMA)
@@ -306,6 +518,10 @@ class UltimateReversalWS:
             st["sigma_avg"] = sigma_short
         else:
             st["sigma_avg"] = 0.98 * st["sigma_avg"] + 0.02 * sigma_short
+
+        # Aşırı sakin market → sinyal üretme
+        if st["sigma_avg"] < LOW_SIGMA_TH:
+            return
 
         # Coin'in tipik z_peak profili (running EMA)
         abs_z = abs(z)
@@ -318,15 +534,36 @@ class UltimateReversalWS:
         dyn_z_th = 0.7 * st["z_peak"] + 0.3 * BASE_Z_SCORE_THRESHOLD
         dyn_z_th = max(1.8, min(4.0, dyn_z_th))
 
+        # Z-score debounce
+        self.z_history[sym_id].append(z)
+        over_th_count = sum(1 for zz in self.z_history[sym_id] if zz >= dyn_z_th)
+        under_th_count = sum(1 for zz in self.z_history[sym_id] if zz <= -dyn_z_th)
+
+        # VWAP
         vwap_prices = prices[-VWAP_WINDOW:]
         vwap_vols   = volumes[-VWAP_WINDOW:]
         vwap = UltimateMath.rolling_vwap(vwap_prices, vwap_vols)
 
+        # EMA kinematics
         smooth = UltimateMath.ema(prices)
         v, a = UltimateMath.get_kinematics(smooth)
 
         vwap_dev_pct = (current_price - vwap) / vwap * 100
         mode = st["mode"]
+
+        # Trend filtresi (context içi fast/slow EMA)
+        # Fast ~ 60s, Slow ~ 180s
+        alpha_fast = 2.0 / (60 + 1)
+        alpha_slow = 2.0 / (180 + 1)
+        ema_fast = UltimateMath.ema(context_window, alpha=alpha_fast)[-1]
+        ema_slow = UltimateMath.ema(context_window, alpha=alpha_slow)[-1]
+
+        if ema_fast > ema_slow * 1.001:
+            trend = "UP"
+        elif ema_fast < ema_slow * 0.999:
+            trend = "DOWN"
+        else:
+            trend = "RANGE"
 
         # Volatiliteye göre reversal yüzdesini dinamik çarpan
         if st["sigma_avg"] > 0:
@@ -335,9 +572,34 @@ class UltimateReversalWS:
             vol_ratio = 1.0
         vol_factor = float(np.clip(vol_ratio, 0.7, 1.5))
 
-        # ============ SHORT (PUMP) ============
+        # Aşırı yüksek volatilite rejimi → giriş daha sıkı
+        vol_regime_mult = 1.3 if st["sigma_avg"] > HIGH_SIGMA_TH else 1.0
+
+        # ---------- RSI ve Uyumsuzluk ----------
+        rsi_series = UltimateMath.rsi(context_window)
+        rsi_curr = float(rsi_series[-1]) if len(rsi_series) > 0 else 50.0
+        st["last_rsi"] = rsi_curr
+
+        # Bearish / bullish divergence tespiti
+        rsi_div_bear, rsi_div_bear_info = UltimateMath.detect_rsi_divergence(
+            context_window, rsi_series, side="SHORT", lookback=RSI_LOOKBACK
+        )
+        rsi_div_bull, rsi_div_bull_info = UltimateMath.detect_rsi_divergence(
+            context_window, rsi_series, side="LONG", lookback=RSI_LOOKBACK
+        )
+
+        # ===================================
+        # ============ SHORT (PUMP) =========
+        # ===================================
+
         if mode == "IDLE":
-            if z >= dyn_z_th and vwap_dev_pct >= VWAP_STRETCH_THRESHOLD:
+            # Trend UP, Z-score uzun süredir yüksek, VWAP'tan anlamlı uzak
+            if (
+                trend == "UP" and
+                over_th_count >= Z_DEBOUNCE_COUNT and
+                z >= dyn_z_th and
+                vwap_dev_pct >= VWAP_STRETCH_THRESHOLD
+            ):
                 st["mode"] = "WATCHING_SHORT"
                 st["apex"] = current_price
                 st["locked_sigma"] = sigma_short
@@ -354,8 +616,11 @@ class UltimateReversalWS:
             curve_broken, curvature, slope, cur_slope = UltimateMath.poly_curve_signal(
                 prices, side="SHORT"
             )
+
+            ENTRY_STRICTNESS_LOCAL = ENTRY_STRICTNESS * vol_factor * vol_regime_mult
+
             final_rev_req = base_rev_req * (CURVE_ACCELERATOR if curve_broken else 1.0)
-            final_rev_req *= ENTRY_STRICTNESS * vol_factor  # daha geç teyit
+            final_rev_req *= ENTRY_STRICTNESS_LOCAL  # daha geç teyit
 
             drop_pct   = (st["apex"] - current_price) / st["apex"] * 100
             drop_sigma = (st["apex"] - current_price) / max(st["locked_sigma"], 1e-6)
@@ -363,11 +628,19 @@ class UltimateReversalWS:
             # Ek şart: Z-score artık ortalamaya yaklaşmış olmalı
             z_back_to_mean = z <= dyn_z_th * Z_EXIT_BAND
 
+            # Wick teyidi (üst fitil)
+            wick_ok = self._check_wick(sym_id, side="SHORT")
+
+            # RSI bearish divergence zorunlu
+            rsi_ok = rsi_div_bear
+
             if (
                 drop_pct >= final_rev_req and
                 drop_sigma >= SIGMA_MOVE_STRICT and
                 a < 0 and
-                z_back_to_mean
+                z_back_to_mean and
+                wick_ok and
+                rsi_ok
             ):
                 await self.send_signal(
                     symbol_id=sym_id,
@@ -383,15 +656,25 @@ class UltimateReversalWS:
                     slope=cur_slope,
                     ctx_mean=ctx_mean,
                     ctx_sigma=ctx_sigma,
-                    sigma_short=sigma_short
+                    sigma_short=sigma_short,
+                    rsi_value=rsi_curr,
+                    rsi_divergence_type="Bearish"
                 )
                 st["mode"] = "COOLDOWN"
                 st["cooldown_until"] = now + COOLDOWN_SEC
                 st["last_signal_ts"]  = now
 
-        # ============ LONG (DUMP) ============
+        # ===================================
+        # ============ LONG (DUMP) ==========
+        # ===================================
+
         if mode == "IDLE":
-            if z <= -dyn_z_th and vwap_dev_pct <= -VWAP_STRETCH_THRESHOLD:
+            if (
+                trend == "DOWN" and
+                under_th_count >= Z_DEBOUNCE_COUNT and
+                z <= -dyn_z_th and
+                vwap_dev_pct <= -VWAP_STRETCH_THRESHOLD
+            ):
                 st["mode"] = "WATCHING_LONG"
                 st["nadir"] = current_price
                 st["apex"]  = float(context_window.max())
@@ -408,8 +691,11 @@ class UltimateReversalWS:
             curve_broken, curvature, slope, cur_slope = UltimateMath.poly_curve_signal(
                 prices, side="LONG"
             )
+
+            ENTRY_STRICTNESS_LOCAL = ENTRY_STRICTNESS * vol_factor * vol_regime_mult
+
             final_bounce_req = base_bounce_req * (CURVE_ACCELERATOR if curve_broken else 1.0)
-            final_bounce_req *= ENTRY_STRICTNESS * vol_factor
+            final_bounce_req *= ENTRY_STRICTNESS_LOCAL
 
             bounce_pct   = (current_price - st["nadir"]) / st["nadir"] * 100
             bounce_sigma = (current_price - st["nadir"]) / max(st["locked_sigma"], 1e-6)
@@ -417,11 +703,19 @@ class UltimateReversalWS:
             # Ek şart: Z-score artık aşırı negatif değil, toparlamış olmalı
             z_back_to_mean = z >= -dyn_z_th * Z_EXIT_BAND
 
+            # Wick teyidi (alt fitil)
+            wick_ok = self._check_wick(sym_id, side="LONG")
+
+            # RSI bullish divergence zorunlu
+            rsi_ok = rsi_div_bull
+
             if (
                 bounce_pct >= final_bounce_req and
                 bounce_sigma >= SIGMA_MOVE_STRICT and
                 a > 0 and
-                z_back_to_mean
+                z_back_to_mean and
+                wick_ok and
+                rsi_ok
             ):
                 await self.send_signal(
                     symbol_id=sym_id,
@@ -437,13 +731,15 @@ class UltimateReversalWS:
                     slope=cur_slope,
                     ctx_mean=ctx_mean,
                     ctx_sigma=ctx_sigma,
-                    sigma_short=sigma_short
+                    sigma_short=sigma_short,
+                    rsi_value=rsi_curr,
+                    rsi_divergence_type="Bullish"
                 )
                 st["mode"] = "COOLDOWN"
                 st["cooldown_until"] = now + COOLDOWN_SEC
                 st["last_signal_ts"]  = now
 
-        # Cooldown'dan çıkış
+        # Cooldown'dan çıkış: fiyat tekrar VWAP civarına gelmiş olsun
         if (
             st["mode"] == "COOLDOWN" and
             now >= st["cooldown_until"] and
@@ -456,7 +752,8 @@ class UltimateReversalWS:
         z, vwap_dev, move_pct,
         reversal_pct, reversal_sigma,
         curve_broken, curvature, slope,
-        ctx_mean, ctx_sigma, sigma_short
+        ctx_mean, ctx_sigma, sigma_short,
+        rsi_value, rsi_divergence_type
     ):
         emoji_side = "🔴 SHORT" if side == "SHORT" else "🟢 LONG"
         title = "PUMP REVERSAL" if side == "SHORT" else "DUMP BOUNCE"
@@ -483,17 +780,18 @@ class UltimateReversalWS:
             f"• Z-Score: <code>{z:.2f}</code>\n"
             f"• VWAP Sapması: <b>%{vwap_dev:.2f}</b>\n"
             f"• 5dk Mean / Sigma: <code>{ctx_mean:.6f}</code> / <code>{ctx_sigma:.6f}</code>\n"
-            f"• 60sn Sigma: <code>{sigma_short:.6f}</code>\n\n"
+            f"• 60sn Sigma: <code>{sigma_short:.6f}</code>\n"
+            f"• RSI (smooth): <code>{rsi_value:.2f}</code> | Divergence: <b>{rsi_divergence_type}</b>\n\n"
             f"📈 <b>Hareket:</b>\n"
             f"• Ana Move (dump/pump): <b>%{move_pct:.2f}</b>\n"
             f"• Reversal: <b>%{reversal_pct:.2f}</b> (%), <b>{reversal_sigma:.2f}σ</b>\n"
             f"• Eğri Hızlandırıcı (Poly): <b>{accel_text}</b>\n\n"
-            f"<i>(VWAP, dinamik Z-score, sigma ve polinom eğri ile geç teyitli dönüş sinyali.)</i>\n"
+            f"<i>(VWAP, dinamik Z-score, sigma, trend filtresi, polinom eğri ve RSI uyumsuzluk ile geç teyitli dönüş sinyali.)</i>\n"
             f"<a href='{binance_url}'>Binance</a> | "
             f"<a href='{tv_url}'>TradingView</a>"
         )
 
-        if self.bot:
+        if self.bot and TG_CHAT_ID != 0:
             try:
                 await self.bot.send_message(
                     chat_id=TG_CHAT_ID,
@@ -501,13 +799,13 @@ class UltimateReversalWS:
                     parse_mode="HTML",
                     disable_web_page_preview=True
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                log("[TG ERR]", e)
 
         log(
             f"SİNYAL: {symbol_id} | {side} | "
             f"move={move_pct:.2f}% | rev={reversal_pct:.2f}% | "
-            f"{reversal_sigma:.2f}σ | z={z:.2f}"
+            f"{reversal_sigma:.2f}σ | z={z:.2f} | rsi={rsi_value:.2f} ({rsi_divergence_type})"
         )
 
     async def run(self):
@@ -523,6 +821,6 @@ if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(engine.run())   
+        loop.run_until_complete(engine.run())
     except KeyboardInterrupt:
-        log("Durduruldu.") 
+        log("Durduruldu.")
