@@ -31,12 +31,12 @@ import websockets
 # ==============================
 
 # 🔐 TELEGRAM
-TG_BOT_TOKEN = "7959911378:AAEl6WlhbJ243tK-WdnTlsoP_scf0RjBpVQ"
-TG_CHAT_ID   = 1222350744
+TG_BOT_TOKEN = "8340330196:AAFKEgl3-tJ94QFOpCeQOmkM7hkSzvnV9r4"
+TG_CHAT_ID   = -4846478269
 
 # 🔐 BINANCE
-BINANCE_API_KEY    = "NQAXu0lgpVinMKr5pAiANMFqLunbiZ5eYMZbm6Zbinr83cEfgextjsalzS87YATQ"
-BINANCE_API_SECRET = "DHdJl7vTnitQvO8GznnXIa66eqho4FOI58gXZN9kJpuWFiyvsVynmGaWOr5oioNe"
+BINANCE_API_KEY    = "H0EkIySNScN72SeXCtBAtq7fiasVs8CAabQLbiSiYbEgZrsJw8W2kU62NWwb7npF"
+BINANCE_API_SECRET = "RAPp0MLsknft7Jr6y7noVrKRZwJxD6O2wPWeS2Kwvoyz4PwVLot4v4m6PGbSz7zm"
 
 # 1 saniyelik internal bar ayarları
 CONTEXT_WINDOW     = 300   # 5 dk = 300 sn
