@@ -33,30 +33,33 @@ VWAP_WINDOW        = 120   # 2 dk
 SIGMA_WINDOW       = 60    # 1 dk
 POLY_WINDOW        = 30    # son 30 sn
 
-# 🔧 OPTUNA SONUÇLARI GÖMÜLDÜ
-BASE_Z_SCORE_THRESHOLD   = 2.50
-VWAP_STRETCH_THRESHOLD   = 1.98
+# 🔧 PARAMETRELER (ÇOK DAHA SIK SİNYAL İÇİN GEVŞETİLMİŞ)
+BASE_Z_SCORE_THRESHOLD   = 1.60      # 2.20 -> 1.60
+VWAP_STRETCH_THRESHOLD   = 0.80      # 1.20 -> 0.80
 
-SIGMA_MOVE_STRICT        = 1.99
-ENTRY_STRICTNESS         = 1.56
+SIGMA_MOVE_STRICT        = 0.90      # 1.60 -> 0.90
+ENTRY_STRICTNESS         = 0.80      # 1.15 -> 0.80
 
-Z_EXIT_BAND              = 0.39
-CURVE_ACCELERATOR        = 0.47
+Z_EXIT_BAND              = 1.10      # 0.65 -> 1.10 (mean'e dönüş şartı çok gevşek)
+CURVE_ACCELERATOR        = 0.85      # eğri kırılınca gereksinimi daha da azalt
 
-MIN_CURVATURE            = 4.9e-05
-EMA_ALPHA                = 0.12
-MIN_RANGE_PCT            = 0.35
+MIN_CURVATURE            = 5.0e-06   # poly daha kolay "kırılmış" sayılır
+EMA_ALPHA                = 0.20      # 0.18 -> 0.20 (EMA daha hızlı)
 
-# Hareket büyüklüğüne göre adaptif reversal yüzdeleri
-REVERSAL_CONFIRM_PCT_MIN = 0.3
+MIN_RANGE_PCT            = 0.20      # 0.30 -> 0.20 (ölü piyasa filtresi gevşek)
+
+# Hareket büyüklüğüne göre adaptif reversal yüzdeleri (iyice gevşetildi)
+REVERSAL_CONFIRM_PCT_MIN = 0.15
 DYNAMIC_THRESHOLDS = [
-    (15.0, 0.5),
-    (7.0,  0.8),
-    (3.0,  1.2),
-    (1.5,  1.8),
+    (15.0, 0.25),
+    (7.0,  0.40),
+    (3.0,  0.70),
+    (1.5,  1.00),
 ]
 
-COOLDOWN_SEC = 90
+# Cooldown kısaltıldı
+COOLDOWN_SEC = 30
+
 WS_URL = "wss://fstream.binance.com/stream?streams=!miniTicker@arr"
 
 
@@ -181,12 +184,11 @@ def detect_regime(sigma_short, sigma_avg, v, a):
 # 4) META-LABEL FİLTRESİ (HL / LH TESTİ)
 # ==============================
 
-async def metalabel_confirmation(engine, sym, side, window=6):
+async def metalabel_confirmation(engine, sym, side, window=2):
     """
-    Sinyal sonrası 6 saniyelik mikro test:
+    Sinyal sonrası çok kısa mikro test:
     - SHORT için: fiyat en az birkaç tik aşağı (LH) yapmalı
     - LONG için: fiyat en az birkaç tik yukarı (HL) yapmalı
-    engine.price_buffers[sym] canlı olarak güncelleniyor.
     """
     if sym not in engine.price_buffers or len(engine.price_buffers[sym]) == 0:
         return False
@@ -202,12 +204,10 @@ async def metalabel_confirmation(engine, sym, side, window=6):
         cur = float(engine.price_buffers[sym][-1])
 
         if side == "SHORT":
-            # aşağı yönlü mikro teyit
             if cur < base:
                 return True
 
         elif side == "LONG":
-            # yukarı yönlü mikro teyit
             if cur > base:
                 return True
 
@@ -341,17 +341,13 @@ class UltimateReversalWS:
 
         price = float(prices[-1])
 
-        # -----------------------------
-        # ÖLÜ PİYASA FİLTRESİ
-        # -----------------------------
+        # Ölü piyasa filtresi
         tail = prices[-SIGMA_WINDOW:]
         rng = (tail.max() - tail.min()) / price * 100
         if rng < MIN_RANGE_PCT:
             return
 
-        # -----------------------------
         # Z + Sigma bağlamı
-        # -----------------------------
         ctx = prices[-CONTEXT_WINDOW:]
         z, mean, sigma_ctx = UltimateMath.z_score(ctx, price)
 
@@ -360,7 +356,7 @@ class UltimateReversalWS:
 
         _, sigma_short = UltimateMath.get_sigma(prices[-SIGMA_WINDOW:])
 
-        # sigma_avg güncelle
+        # sigma_avg
         if st["sigma_avg"] == 0:
             st["sigma_avg"] = sigma_short
         else:
@@ -373,9 +369,7 @@ class UltimateReversalWS:
         else:
             st["z_peak"] = 0.98 * st["z_peak"] + 0.02 * abs_z
 
-        # -----------------------------
-        # REJİM TESPİTİ (UP / DOWN / CHOP)
-        # -----------------------------
+        # Rejim tespiti
         sm = UltimateMath.ema(prices)
         v, a = UltimateMath.get_kinematics(sm)
         regime = detect_regime(sigma_short, st["sigma_avg"], v, a)
@@ -385,20 +379,14 @@ class UltimateReversalWS:
         sig_strict = SIGMA_MOVE_STRICT
 
         if regime == "HIGH_CHOP":  # çok gürültülü
-            entry_strict *= 1.25
-            sig_strict *= 1.25
-
+            entry_strict *= 1.05
+            sig_strict *= 1.05
         elif regime == "UP_TREND" and a > 0:
-            # LONG için gevşet
-            entry_strict *= 0.85
-
+            entry_strict *= 0.9
         elif regime == "DOWN_TREND" and a < 0:
-            # SHORT için gevşet
-            entry_strict *= 0.85
+            entry_strict *= 0.9
 
-        # -----------------------------
         # VWAP – eğri – z
-        # -----------------------------
         vw_prices = prices[-VWAP_WINDOW:]
         vw_vols = vols[-VWAP_WINDOW:]
         vwap = UltimateMath.rolling_vwap(vw_prices, vw_vols)
@@ -410,12 +398,13 @@ class UltimateReversalWS:
         vol_ratio = sigma_short / max(st["sigma_avg"], 1e-8)
         vol_factor = float(np.clip(vol_ratio, 0.7, 1.5))
 
+        # Dinamik Z eşiği (daha da gevşek clamp)
+        dyn_z = 0.4 * st["z_peak"] + 0.6 * BASE_Z_SCORE_THRESHOLD
+        dyn_z = max(1.2, min(3.0, dyn_z))
+
         # ================
         # 1) SHORT START
         # ================
-        dyn_z = 0.7 * st["z_peak"] + 0.3 * BASE_Z_SCORE_THRESHOLD
-        dyn_z = max(1.8, min(4.0, dyn_z))
-
         if mode == "IDLE" and z >= dyn_z and vwap_dev >= VWAP_STRETCH_THRESHOLD:
             st["mode"] = "WATCHING_SHORT"
             st["apex"] = price
@@ -447,9 +436,6 @@ class UltimateReversalWS:
 
             z_mean_ok = z <= dyn_z * Z_EXIT_BAND
 
-            # -------------------------------
-            # META-LABEL TEST + SİNYAL
-            # -------------------------------
             if (
                 drop_pct >= final_req and
                 drop_sigma >= sig_strict and
@@ -468,7 +454,7 @@ class UltimateReversalWS:
                     st["mode"] = "COOLDOWN"
                     st["cooldown_until"] = now + COOLDOWN_SEC
                 else:
-                    st["mode"] = "IDLE"  # test başarısız → sinyal iptal
+                    st["mode"] = "IDLE"
 
         # ================
         # 2) LONG START
@@ -504,9 +490,6 @@ class UltimateReversalWS:
 
             z_mean_ok = z >= -dyn_z * Z_EXIT_BAND
 
-            # -------------------------------
-            # META-LABEL TEST + SİNYAL
-            # -------------------------------
             if (
                 bounce_pct >= final_req and
                 bounce_sigma >= sig_strict and
@@ -527,9 +510,7 @@ class UltimateReversalWS:
                 else:
                     st["mode"] = "IDLE"
 
-        # ====================
         # COOLDOWN'DAN ÇIKIŞ
-        # ====================
         if (
             st["mode"] == "COOLDOWN" and
             now >= st["cooldown_until"] and
@@ -592,7 +573,7 @@ class UltimateReversalWS:
 
 
 # ==============================
-# 9) MAIN
+# MAIN
 # ==============================
 if __name__ == "__main__":
     engine = UltimateReversalWS()
