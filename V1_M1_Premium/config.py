@@ -7,8 +7,8 @@ SETTINGS = {
     "TG_BOT_TOKEN": "7959911378:AAEl6WlhbJ243tK-WdnTlsoP_scf0RjBpVQ",
     "TG_CHAT_ID": 1222350744,
     # Binance
-    "BINANCE_API_KEY": "NQAXu0lgpVinMKr5pAiANMFqLunbiZ5eYMZbm6Zbinr83cEfgextjsalzS87YATQ",
-    "BINANCE_API_SECRET": "DHdJl7vTnitQvO8GznnXIa66eqho4FOI58gXZN9kJpuWFiyvsVynmGaWOr5oioNe",
+    "BINANCE_API_KEY": "",
+    "BINANCE_API_SECRET": "",
     # Windows
     "CONTEXT_WINDOW": 300,
     "VWAP_WINDOW": 120,
